@@ -675,6 +675,34 @@ fn global() -> &'static Mutex<Cache> {
     C.get_or_init(|| Mutex::new(Cache::default()))
 }
 
+/// Signalled by [`async_worker`] every time it files a result, under [`global`].
+///
+/// Only [`translate_cached_kernel_reflected`] waits on it, and only for an entry
+/// that is already `Loading`: see [`KERNEL_PENDING_WAIT`] for why that wait
+/// exists and why it is bounded.
+fn translation_filed() -> &'static std::sync::Condvar {
+    static CV: std::sync::OnceLock<std::sync::Condvar> = std::sync::OnceLock::new();
+    CV.get_or_init(std::sync::Condvar::new)
+}
+
+/// How long a kernel dispatch waits for a translation that is already running.
+///
+/// The ordering plane holds a transaction until the kernels it binds are
+/// translated, but only for a lease it can still name. A pipeline ref the guest
+/// deleted and then pointed at different AIR reaches admission as a retired
+/// lease, which `PipelineTable::waits_for` lets through without a wait; the
+/// dispatch then finds its translation `Loading` and, without this, is dropped
+/// (`m2v_translation_pending_at_sync_boundary`, `compute_record` class
+/// `metal_failed`) and the guest reads back an untouched texture. Measured on the
+/// x86 macos-13 rail: a second guest process reusing ref 8 lost its first
+/// dispatch while the same process's other two kernels ran.
+///
+/// Waiting is no worse than the miss arm below, which translates synchronously
+/// on this same thread, and a queued kernel finishes in tens of milliseconds
+/// (16-54 ms on that rail). The bound keeps a stuck worker from holding the
+/// doorbell vCPU: past it the dispatch declines exactly as it did before.
+const KERNEL_PENDING_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
 fn stage_tag(stage: Stage) -> u8 {
     match stage {
         Stage::Vertex => 1,
@@ -1088,6 +1116,7 @@ fn async_worker() {
             };
             (c.hits, c.misses, detail, failure)
         };
+        translation_filed().notify_all();
         let dims = task
             .kernel_local_size
             .map(|d| format!(" tg=[{},{},{}]", d[0], d[1], d[2]))
@@ -1223,6 +1252,24 @@ pub fn translate_cached_kernel_reflected(
     let id = ShaderId::kernel(air, local_size);
     {
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(c.find(id), Some(Entry::Loading)) {
+            let started = std::time::Instant::now();
+            let (guard, timeout) = translation_filed()
+                .wait_timeout_while(c, KERNEL_PENDING_WAIT, |c| {
+                    matches!(c.find(id), Some(Entry::Loading))
+                })
+                .unwrap_or_else(|e| e.into_inner());
+            c = guard;
+            crate::observe::off(format!(
+                "linux_m2v_kernel_pending_wait pipe={pipeline_ref} tg=[{},{},{}] waited_us={} \
+                 filed={}",
+                local_size[0],
+                local_size[1],
+                local_size[2],
+                started.elapsed().as_micros(),
+                !timeout.timed_out()
+            ));
+        }
         match c.find(id).cloned() {
             Some(Entry::Ready(shader)) => {
                 c.hits = c.hits.saturating_add(1);
@@ -1869,6 +1916,66 @@ mod tests {
         };
         assert_eq!(err, stored);
         assert!(global().lock().unwrap().find(id).is_none());
+        reset_for_test();
+    }
+
+    /// A kernel dispatch that meets its own translation still running waits for
+    /// the worker to file it instead of dropping the dispatch — the retired-lease
+    /// admission lets such a dispatch through, and dropping it loses the guest's
+    /// write. The filing is simulated the way [`async_worker`] does it: put the
+    /// result under the lock, then signal.
+    #[test]
+    fn a_kernel_translation_already_running_is_waited_for() {
+        let _guard = test_lock();
+        reset_for_test();
+        let air = b"kernel-air-translating-when-dispatched";
+        let local_size = [16u32, 16, 1];
+        let id = ShaderId::kernel(air, local_size);
+        global()
+            .lock()
+            .unwrap()
+            .put(id, &Arc::from(&air[..]), Entry::Loading);
+        let filed = synth_shader(Stage::Kernel, vec![0x03, 0x02, 0x23, 0x07]);
+        let worker = {
+            let filed = Arc::clone(&filed);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let id = ShaderId::kernel(air, local_size);
+                global()
+                    .lock()
+                    .unwrap()
+                    .put(id, &Arc::from(&air[..]), Entry::Ready(filed));
+                translation_filed().notify_all();
+            })
+        };
+
+        let shader = translate_cached_kernel_reflected(air, local_size, 8)
+            .expect("the dispatch runs once its translation is filed");
+        worker.join().unwrap();
+        assert!(Arc::ptr_eq(&shader, &filed));
+        reset_for_test();
+    }
+
+    /// The wait is bounded: a translation that never files still declines as
+    /// pending, after [`KERNEL_PENDING_WAIT`] and not before.
+    #[test]
+    fn a_kernel_translation_that_never_files_still_declines_as_pending() {
+        let _guard = test_lock();
+        reset_for_test();
+        let air = b"kernel-air-whose-worker-never-files";
+        let local_size = [8u32, 8, 1];
+        global().lock().unwrap().put(
+            ShaderId::kernel(air, local_size),
+            &Arc::from(&air[..]),
+            Entry::Loading,
+        );
+
+        let started = std::time::Instant::now();
+        let Err(err) = translate_cached_kernel_reflected(air, local_size, 8) else {
+            panic!("nothing was filed, so there is nothing to run");
+        };
+        assert_eq!(err, M2vCacheDecline::TranslationPending { stage: "kernel" });
+        assert!(started.elapsed() >= KERNEL_PENDING_WAIT);
         reset_for_test();
     }
 
