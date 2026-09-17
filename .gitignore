@@ -68,3 +68,6 @@ Vulkan-Headers/
 # what a stray instrumented `cargo test` drops in the tree).
 *.profraw
 *.profdata
+
+# MCP
+.mcp.json
