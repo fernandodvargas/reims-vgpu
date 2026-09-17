@@ -2192,7 +2192,7 @@ pub fn reflected_storage_image_format(
         TextureFormat::R8 => ImageFormat::R8Unorm,
         TextureFormat::Rgba8 => ImageFormat::Rgba8Unorm,
         TextureFormat::R16f => ImageFormat::R16Float,
-        TextureFormat::R16ui => ImageFormat::Unsupported(16),
+        TextureFormat::R16ui => ImageFormat::Unsupported(38),
         TextureFormat::Rg16f => ImageFormat::Rg16Float,
         // SPIR-V `Rg32f`. The device has no two-channel 32-bit float storage
         // surface — neither `StorageImageSelector` nor `TexelLayout` names one
@@ -2200,9 +2200,9 @@ pub fn reflected_storage_image_format(
         // unsupported, which round-trips through `raw`/`from_raw` unchanged.
         TextureFormat::Rg32f => ImageFormat::Unsupported(6),
         TextureFormat::R32f => ImageFormat::R32Float,
-        TextureFormat::R32i => ImageFormat::Unsupported(17),
+        TextureFormat::R32i => ImageFormat::Unsupported(24),
         TextureFormat::R32ui => ImageFormat::R32ui,
-        TextureFormat::Rgba32i => ImageFormat::Unsupported(18),
+        TextureFormat::Rgba32i => ImageFormat::Unsupported(21),
         TextureFormat::Rgba32ui => ImageFormat::Rgba32Uint,
         TextureFormat::Rgba32f => ImageFormat::Rgba32Float,
         TextureFormat::Rgba16f => ImageFormat::Rgba16Float,
@@ -4329,6 +4329,30 @@ mod more_tests {
             ReflectedBufferAccess::Unused,
             "access is not gated on the extent switch"
         );
+    }
+
+    /// Every storage format the translator can declare reports the SPIR-V
+    /// ordinal the emitter decorates the image with, supported or not. The
+    /// unsupported arms carry a bare number, and `R16ui`, `R32i` and `Rgba32i`
+    /// once carried `Rgba16Snorm`'s, `Rg16Snorm`'s and `Rg8Snorm`'s; the
+    /// expected value comes from `to_spirv_format`, the `spirv` crate's own
+    /// enum, so the table cannot drift from what lands in the module.
+    #[test]
+    fn reflected_storage_image_format_reports_the_emitted_spirv_ordinal() {
+        for format in metal2vulkan::meta::TextureFormat::ALL {
+            let mut storage = shape(TextureDimension::D2, false, true);
+            storage.storage_format = Some(format);
+            let mut reflection = empty_reflection(ShaderStage::Kernel);
+            let mut binding = texture_binding(TEXTURE_BINDING_BASE + 1, storage);
+            binding.kind = ResourceKind::StorageImage;
+            reflection.bindings.push(binding);
+            assert_eq!(
+                reflected_storage_image_format(&reflection, TEXTURE_BINDING_BASE + 1)
+                    .map(ImageFormat::raw),
+                Some(format.to_spirv_format() as u32),
+                "{format:?}"
+            );
+        }
     }
 
     fn texture_binding(binding: u32, shape: TextureShape) -> ResourceBinding {
