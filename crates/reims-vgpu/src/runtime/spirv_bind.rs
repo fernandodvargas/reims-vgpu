@@ -2209,6 +2209,8 @@ pub fn reflected_storage_image_format(
         TextureFormat::Rgba8ui => ImageFormat::Rgba8Uint,
         TextureFormat::Rgba16ui => ImageFormat::Rgba16Uint,
         TextureFormat::Rgba8i => ImageFormat::Rgba8Sint,
+        // SPIR-V `Rgba16i`: no signed 16-bit storage surface on the device either.
+        TextureFormat::Rgba16i => ImageFormat::Unsupported(22),
     })
 }
 
