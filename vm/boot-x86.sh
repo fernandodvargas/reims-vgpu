@@ -22,9 +22,17 @@
 #
 # SNAPSHOT-REVERT (same model as vm/boot-arm64.sh): within a rail, snapshots form
 # an IMMUTABLE HISTORY (each file read-only, never overwritten). EVERY boot starts
-# from a byte-identical COW clone of the selected snapshot (btrfs reflink when
-# available) and discards that clone on exit, so a harsh kill or a wedge costs
-# nothing and poisons nothing. A snapshot is never booted directly.
+# from a disposable view of the selected snapshot and discards it on exit, so a
+# harsh kill or a wedge costs nothing and poisons nothing. A snapshot is never
+# booted directly. The reverting classes (--testing, --interactive) boot the
+# snapshot's `macos.img` with QEMU's `snapshot=on`: QEMU opens it read-only and
+# writes to a temporary qcow2 overlay it creates in $TMPDIR (pointed at RUN_DIR)
+# and unlinks at once, so the space returns when QEMU exits, however it exits.
+# That costs no copy on a filesystem without reflink (a full clone of a 28 GB
+# disk on ext4 took ~8.5 min before QEMU started) and needs no qemu-img, which
+# the lab images do not carry. OpenCore.qcow2 and OVMF_VARS.fd are small and are
+# still cloned. --capture boots a full clone of all three (reflink when
+# available), because what it captures must be a self-contained snapshot.
 #
 # Selection by either coordinate is per-boot and repoints no `current` symlink.
 #
@@ -453,18 +461,31 @@ if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
   OPENCORE="$OPENCORE_MASTER"
   OVMF_VARS="$OVMF_VARS_MASTER"
   IS_CLONE=0
+  DISK_IS_CLONE=0
+  DISK_OPTS=""
   SNAPSHOT_NAME="(bootstrap)"
   echo "boot-x86.sh: rail '$RAIL_NAME' — bootstrap; booting provisioned masters write-through (rail is empty) ..."
 else
-  DISK="$RUN_DIR/macos-$STAMP.img"
   OPENCORE="$RUN_DIR/OpenCore-$STAMP.qcow2"
   OVMF_VARS="$RUN_DIR/OVMF_VARS-$STAMP.fd"
   IS_CLONE=1
   echo "boot-x86.sh: rail '$RAIL_NAME' — reverting to snapshot '$SNAPSHOT_NAME' ($SNAPSHOT_SRC) ..."
-  clone_file "$SNAPSHOT_SRC/macos.img" "$DISK"
+  if [ "$BOOT_CLASS" = "capture" ]; then
+    DISK="$RUN_DIR/macos-$STAMP.img"
+    DISK_IS_CLONE=1
+    DISK_OPTS=""
+    clone_file "$SNAPSHOT_SRC/macos.img" "$DISK"
+    chmod u+w "$DISK"
+  else
+    # The snapshot file itself, never written: `snapshot=on` below. Resolved
+    # now, so repointing `current` mid-boot cannot change what this boot reads.
+    DISK="$(realpath "$SNAPSHOT_SRC/macos.img")" || die "cannot resolve $SNAPSHOT_SRC/macos.img"
+    DISK_IS_CLONE=0
+    DISK_OPTS=",snapshot=on"
+  fi
   clone_file "$SNAPSHOT_SRC/OpenCore.qcow2" "$OPENCORE"
   clone_file "$SNAPSHOT_SRC/OVMF_VARS.fd" "$OVMF_VARS"
-  chmod u+w "$DISK" "$OPENCORE" "$OVMF_VARS"
+  chmod u+w "$OPENCORE" "$OVMF_VARS"
 fi
 
 # --- Network -------------------------------------------------------------------
@@ -530,7 +551,7 @@ QEMU_ARGS=(
   -device ich9-ahci,id=sata
   -drive "id=OpenCoreBoot,if=none,format=qcow2,file=$OPENCORE"
   -device ide-hd,bus=sata.2,drive=OpenCoreBoot
-  -drive "id=MacHDD,if=none,format=qcow2,file=$DISK"
+  -drive "id=MacHDD,if=none,format=qcow2,file=$DISK$DISK_OPTS"
   -device ide-hd,bus=sata.4,drive=MacHDD
   -qmp "unix:$QMP_SOCK,server=on,wait=off"
 )
@@ -607,8 +628,13 @@ echo "boot-x86.sh: ssh → localhost:$SSH_PORT   serial → $SERIAL_LOG   qmp �
 [ -n "$TRACE_LOG" ] && echo "boot-x86.sh: trace → $TRACE_LOG ($TRACE_SPEC)"
 
 discard_clone() {
+  # Under `snapshot=on` DISK is the snapshot itself; its throwaway overlay is
+  # already unlinked, so only a cloned disk is removed here.
+  if [ "${DISK_IS_CLONE:-0}" -eq 1 ]; then
+    rm -f "$DISK"
+  fi
   if [ "${IS_CLONE:-1}" -eq 1 ]; then
-    rm -f "$DISK" "$OPENCORE" "$OVMF_VARS"
+    rm -f "$OPENCORE" "$OVMF_VARS"
   fi
   rm -f "$QMP_SOCK"
   # `qmp.sock` is the shared name every driver script resolves, and it is
@@ -733,7 +759,7 @@ if [ "$BOOT_CLASS" = "interactive" ] || [ "$BOOT_CLASS" = "capture" ]; then
   # gtk display + serial multiplexed with the monitor on stdio (Apple EB logs on console).
   QEMU_ARGS+=(-display "$REIMS_VGPU_DISPLAY" -serial mon:stdio)
   rc=0
-  "$QEMU_BIN" "${QEMU_ARGS[@]}" || rc=$?
+  TMPDIR="$RUN_DIR" "$QEMU_BIN" "${QEMU_ARGS[@]}" || rc=$?
   if [ "$BOOT_CLASS" = "capture" ] && [ "$rc" -eq 0 ]; then
     # mon:stdio does not fill SERIAL_LOG; promote on clean QEMU exit.
     promote_to_snapshot
@@ -813,7 +839,7 @@ capture_then_revert() {
   echo "boot-x86.sh: reverted (clone discarded); evidence in $RUN_DIR (serial-$STAMP.log)"
 }
 
-"$QEMU_BIN" "${QEMU_ARGS[@]}" &
+TMPDIR="$RUN_DIR" "$QEMU_BIN" "${QEMU_ARGS[@]}" &
 QEMU_PID=$!
 trap 'capture_then_revert signal; exit 130' INT TERM
 
