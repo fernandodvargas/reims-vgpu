@@ -783,12 +783,18 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         // translator's reflection — the declared Metal texture type, exact at
         // translate time. The always-on `census_reflection_wellformed` guard
         // proves the reflection is internally consistent per translate.
-        let is_storage = match crate::runtime::spirv_bind::reflected_compute_texture(
+        let (is_storage, shape) = match crate::runtime::spirv_bind::reflected_compute_texture(
             &kernel_shader.reflection,
             binding,
         ) {
-            ReflectedComputeTexture::Plain2d(ImageAccess::Sampled) => false,
-            ReflectedComputeTexture::Plain2d(ImageAccess::Storage) => true,
+            ReflectedComputeTexture::Plain2d(access) => (
+                access == ImageAccess::Storage,
+                super::ComputeTextureShape::Plain2d,
+            ),
+            ReflectedComputeTexture::Cube(access) => (
+                access == ImageAccess::Storage,
+                super::ComputeTextureShape::Cube,
+            ),
             ReflectedComputeTexture::Multisample2d => {
                 // Not staged, because there is nothing to stage from and
                 // nothing to stage into: a multisample image is filled by
@@ -825,11 +831,11 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 continue;
             }
             ReflectedComputeTexture::UnstageableShape { axis } => {
-                // The rail stages one flat plane window or one linear GVA level
-                // per binding, so it can only ever produce a single-layer 2D
-                // image. Binding that to a shader image declared with a slice,
-                // depth, or sample axis is a descriptor-type mismatch — refuse
-                // by name instead of dispatching against the wrong view.
+                // The rail stages one flat plane window, one linear GVA level,
+                // or one cube's six contiguous faces per binding. Binding that
+                // to a shader image declared with a slice, depth, or sample
+                // axis is a descriptor-type mismatch — refuse by name instead
+                // of dispatching against the wrong view.
                 crate::observe::fail(format!(
                     "compute_linux texture_shape fail reason=unstageable_{axis} pipe={} i={} ref={} bind={binding}",
                     acc.pipeline_ref, t.index, t.texture_ref
@@ -868,6 +874,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
             t.texture_ref,
             binding,
             is_storage,
+            shape,
         ) {
             Ok(mut s) => {
                 s.rail.array_element = descriptor.array_element;
@@ -1108,6 +1115,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 format: shader_fmt,
                 width: t.width,
                 height: t.height,
+                shape: t.shape,
                 bytes: std::mem::take(&mut t.bytes),
                 // The guest window this output belongs to is on `t.writeback`,
                 // so the destination is decided from the window rather than
@@ -1146,6 +1154,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 format: sampled_fmt,
                 width: t.width,
                 height: t.height,
+                shape: t.shape,
                 mip_levels: t.mip_levels,
                 // Asked in the order the sources exclude each other, not as a
                 // pair: the producer that sets `multisample_target` is the one
@@ -1196,6 +1205,18 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         )
         .field("pipe", acc.pipeline_ref)
         .fail_once((u64::from(acc.pipeline_ref) << 32) | u64::from(binding));
+        // The stand-in takes the shape the shader declares: a 2D image bound
+        // where the module declares a cube is the descriptor-type mismatch the
+        // stand-in exists to avoid.
+        let shape = match crate::runtime::spirv_bind::reflected_compute_texture(
+            &kernel_shader.reflection,
+            binding,
+        ) {
+            crate::runtime::spirv_bind::ReflectedComputeTexture::Cube(_) => {
+                super::ComputeTextureShape::Cube
+            }
+            _ => super::ComputeTextureShape::Plain2d,
+        };
         sampled_images.push(ComputeSampledImageResource {
             binding,
             array_element: 0,
@@ -1203,13 +1224,17 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
             format: crate::backend::vulkan::engine::StorageImageFormat::Rgba8Unorm,
             width: NEUTRAL_SAMPLED_IMAGE_EXTENT,
             height: NEUTRAL_SAMPLED_IMAGE_EXTENT,
+            shape,
             // A stand-in for a binding the guest left empty is one level.
             mip_levels: 1,
-            source: ComputeSampledSource::Bytes(pixel_format::solid_rgba8(
-                NEUTRAL_SAMPLED_IMAGE_EXTENT,
-                NEUTRAL_SAMPLED_IMAGE_EXTENT,
-                &[0.0; 4],
-            )),
+            source: ComputeSampledSource::Bytes(
+                pixel_format::solid_rgba8(
+                    NEUTRAL_SAMPLED_IMAGE_EXTENT,
+                    NEUTRAL_SAMPLED_IMAGE_EXTENT,
+                    &[0.0; 4],
+                )
+                .repeat(shape.layers() as usize),
+            ),
         });
     }
 
@@ -1963,6 +1988,7 @@ fn multisample_sampled_texture<M: HostMemory + HostOps>(
         height,
         // A multisample texture has one level by construction.
         mip_levels: 1,
+        shape: ComputeTextureShape::Plain2d,
         bytes: Vec::new(),
         is_storage: false,
         // Read-only: the kernel declares `access::read` or this shape would

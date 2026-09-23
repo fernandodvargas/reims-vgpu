@@ -103,6 +103,16 @@ pub(crate) fn split_staged_textures(
     let mut sampled: Vec<ReimsVgpuComputeSampledImage> = Vec::new();
     for t in staged {
         let selector = t.storage_selector_or_refuse(task_id, pipeline_ref)?;
+        // Both ABI image records are one 2D image. Nothing on this rail stages
+        // another shape today; a layered binding reaching it would be bound as
+        // its first face, so it is refused by name rather than flattened.
+        if t.shape != super::ComputeTextureShape::Plain2d {
+            crate::observe::fail(format!(
+                "compute_stage_tex metal_fail reason=layered_shape task={task_id} pipe={pipeline_ref} bind={} shape={:?}",
+                t.binding, t.shape
+            ));
+            return Err(ComputeStatus::Unsupported("metal_layered_shape"));
+        }
         if t.is_storage {
             storage.push(ReimsVgpuStorageImage {
                 binding: t.binding,
@@ -436,7 +446,15 @@ pub(crate) fn execute_dispatch_metal<M: HostMemory + HostOps>(
         let binding = REIMS_VGPU_BINDING_TEXTURE_BASE + t.index;
         let is_storage = texture_binds_as_storage(&usages, binding);
         let stage_call_started = std::time::Instant::now();
-        match stage_texture_raw(state, host, task_id, t.texture_ref, binding, is_storage) {
+        match stage_texture_raw(
+            state,
+            host,
+            task_id,
+            t.texture_ref,
+            binding,
+            is_storage,
+            crate::runtime::compute_exec::ComputeTextureShape::Plain2d,
+        ) {
             Ok(s) => {
                 // Measure-only: localize per-texture stage cost (the
                 // transition-window guest stall).

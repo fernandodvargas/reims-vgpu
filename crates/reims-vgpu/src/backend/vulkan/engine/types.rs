@@ -1621,18 +1621,21 @@ pub struct ComputeBufferOutput {
 
 /// Storage image for compute. Formats mirror the live `simg_u32_to_vk_storage` map.
 ///
-/// Single-layer 2D only: a compute texture binding is staged from one mapper-ref-texture
-/// plane window or one linear GVA level, both of which are a flat `width ×
-/// height` rectangle. There is no decoded slice or depth axis on this rail, so
-/// the engine builds `TYPE_2D` unconditionally.
+/// A 2D image or one cube (see [`ComputeTextureShape`]): a compute texture
+/// binding is staged from one mapper-ref-texture plane window, one linear GVA
+/// level, or one linear cube's six contiguous faces. There is no other slice
+/// or depth axis on this rail.
 #[derive(Debug)]
 pub struct ComputeStorageImageResource {
     pub binding: u32,
     pub array_element: u32,
     pub descriptor_count: u32,
     pub format: StorageImageFormat,
+    /// Extent of one layer: for a cube, of one face.
     pub width: u32,
     pub height: u32,
+    /// Layers `bytes` carries, face after face, and the view the shader binds.
+    pub shape: ComputeTextureShape,
     /// Seed content, read *into* the image before the dispatch.
     ///
     /// Deliberately still a host allocation, and not paired with
@@ -1681,7 +1684,7 @@ pub struct ComputeStorageResidency {
 /// images because both are derived from the same Metal pixel-format contract;
 /// descriptor access is carried separately by the request field.
 ///
-/// Single-layer 2D only, for the same reason as
+/// A 2D image or one cube, for the same reason as
 /// [`ComputeStorageImageResource`].
 #[derive(Debug)]
 pub struct ComputeSampledImageResource {
@@ -1689,8 +1692,12 @@ pub struct ComputeSampledImageResource {
     pub array_element: u32,
     pub descriptor_count: u32,
     pub format: StorageImageFormat,
+    /// Extent of one layer: for a cube, of one face.
     pub width: u32,
     pub height: u32,
+    /// Layers each level of `source` carries, face after face, and the view
+    /// the shader binds.
+    pub shape: ComputeTextureShape,
     /// Levels `bytes` carries, base first, tightly packed by
     /// [`reims_vgpu_protocol::extent::tight_pyramid_spans`] — `1` for every
     /// binding but a guest mip chain sampled by an explicit LOD.
@@ -1746,6 +1753,9 @@ pub enum ComputeSampledSource {
 /// no request — so it belongs beside the table that resolves it. It is named
 /// here because the engine's request types are built out of it.
 pub use reims_vgpu_vulkan::pixel::StorageImageFormat;
+
+/// The staged image shapes, named where they are staged.
+pub use crate::runtime::compute_exec::ComputeTextureShape;
 
 // ---------------------------------------------------------------------------
 // Draw residency (workstream D)

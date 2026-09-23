@@ -150,6 +150,7 @@ impl ResourcePools {
             .device
             .create_image(
                 &vk::ImageCreateInfo::default()
+                    .flags(key.create_flags())
                     .image_type(vk::ImageType::TYPE_2D)
                     .format(format)
                     .extent(vk::Extent3D {
@@ -158,7 +159,7 @@ impl ResourcePools {
                         depth: 1,
                     })
                     .mip_levels(key.mip_levels.max(1))
-                    .array_layers(1)
+                    .array_layers(key.shape.layers())
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
                     .usage(if key.sampled_only {
@@ -248,12 +249,10 @@ impl ResourcePools {
             .create_image_view(
                 &vk::ImageViewCreateInfo::default()
                     .image(image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .view_type(key.view_type())
                     .format(format)
                     .components(components)
-                    .subresource_range(super::super::color_subresource_range_levels(
-                        key.mip_levels,
-                    )),
+                    .subresource_range(key.subresource_range()),
                 None,
             )
             .map_err(|e| {

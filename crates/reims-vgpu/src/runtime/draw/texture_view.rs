@@ -21,6 +21,22 @@ pub(crate) struct ViewResolve {
     pub(crate) swizzle: Option<pixel_format::SwizzlePlan>,
     /// Non-zero view pixel format from the descriptor (`@16`); `None` inherits the base format.
     pub(crate) pixel_format: Option<u16>,
+    /// First slice of `base_texture_ref` the view exposes: every hop's own
+    /// slice base summed down the chain, because each hop's range is relative
+    /// to the hop below it (the composition `blit_exec` applies per hop).
+    pub(crate) slice_base: u64,
+    /// How many slices the outermost view exposes.
+    pub(crate) slice_count: u64,
+}
+
+/// One decoded texture-view hop, before the chain is collapsed.
+struct ViewHop {
+    base: u32,
+    level: u32,
+    swizzle: Option<pixel_format::SwizzlePlan>,
+    pixel_format: Option<u16>,
+    slice_base: u64,
+    slice_count: u64,
 }
 
 /// A specific refusal while resolving one texture-view texture-view chain.
@@ -66,6 +82,11 @@ pub(crate) enum TextureViewDecline {
         base: u32,
         depth: u32,
     },
+    /// The hops' slice bases do not sum inside `u64`.
+    ChainSliceOverflow {
+        base: u32,
+        depth: u32,
+    },
 }
 
 impl Decline for TextureViewDecline {
@@ -87,6 +108,7 @@ impl Decline for TextureViewDecline {
             Self::HopSwizzleInvalid { .. } => "texture_view_hop_swizzle_invalid",
             Self::ChainSelfOrZero { .. } => "texture_view_chain_self_or_zero",
             Self::ChainOverflow { .. } => "texture_view_chain_overflow",
+            Self::ChainSliceOverflow { .. } => "texture_view_chain_slice_overflow",
         }
     }
 
@@ -160,7 +182,7 @@ impl Decline for TextureViewDecline {
                 ("next", next.to_string()),
                 ("depth", depth.to_string()),
             ],
-            Self::ChainOverflow { base, depth } => {
+            Self::ChainOverflow { base, depth } | Self::ChainSliceOverflow { base, depth } => {
                 vec![("base", base.to_string()), ("depth", depth.to_string())]
             }
         }
@@ -257,7 +279,7 @@ fn decode_texture_view_hop_reasoned<M: HostMemory + HostOps>(
     host: &M,
     task_id: u32,
     texture_ref: u32,
-) -> Result<(u32, u32, Option<pixel_format::SwizzlePlan>, Option<u16>), TextureViewDecline> {
+) -> Result<ViewHop, TextureViewDecline> {
     use crate::runtime::decode::resource::{
         decode_texture_view_descriptor, texture_view_header, OBJECT_TYPE_TEXTURE_VIEW,
     };
@@ -331,7 +353,15 @@ fn decode_texture_view_hop_reasoned<M: HostMemory + HostOps>(
     };
     // Zero pixel_format means inherit base (serializer always writes a real format when set).
     let pixel_format = view.declared_pixel_format();
-    Ok((view.base_texture_ref, level, swizzle, pixel_format))
+    let (slice_base, slice_count) = view.slice_range();
+    Ok(ViewHop {
+        base: view.base_texture_ref,
+        level,
+        swizzle,
+        pixel_format,
+        slice_base,
+        slice_count,
+    })
 }
 
 /// Resolve texture-view to non-view base + mip + format override + swizzle.
@@ -350,8 +380,14 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
 ) -> Result<ViewResolve, TextureViewDecline> {
     use crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VIEW;
 
-    let (mut base, level, swizzle, pixel_format) =
-        decode_texture_view_hop_reasoned(state, host, task_id, texture_ref)?;
+    let ViewHop {
+        mut base,
+        level,
+        swizzle,
+        pixel_format,
+        mut slice_base,
+        slice_count,
+    } = decode_texture_view_hop_reasoned(state, host, task_id, texture_ref)?;
 
     // Collapse nested texture-view bases to a non-view texture (mapper-ref-texture /
     // normal-texture).
@@ -366,10 +402,14 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
             break;
         }
         depth += 1;
-        let (next, _lvl, _sw, _fmt) = decode_texture_view_hop_reasoned(state, host, task_id, base)?;
+        let hop = decode_texture_view_hop_reasoned(state, host, task_id, base)?;
+        let next = hop.base;
         if next == 0 || next == base {
             return Err(TextureViewDecline::ChainSelfOrZero { base, next, depth });
         }
+        slice_base = slice_base
+            .checked_add(hop.slice_base)
+            .ok_or(TextureViewDecline::ChainSliceOverflow { base, depth })?;
         base = next;
     }
 
@@ -385,6 +425,8 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
         level,
         swizzle,
         pixel_format,
+        slice_base,
+        slice_count,
     })
 }
 

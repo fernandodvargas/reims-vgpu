@@ -609,6 +609,95 @@ impl TextureDescriptor {
         }
         Some((base.checked_add(layout.offset)?, layout))
     }
+
+    /// Guest VA of array slice / cube face `slice` of mip `level`, and that
+    /// level's layout, for a reader of the whole slice through `rows` rows of
+    /// storage (`pixel_format::tight_row_count`: block rows for a compressed
+    /// format, texel rows otherwise) of `tight_row` bytes each.
+    ///
+    /// Slice 0 is [`Self::level_gva`] unchanged. A non-zero slice sits `slice`
+    /// whole images past its level's base, an image being `row_stride * rows *
+    /// planes` — padding included, because slices are contiguous images and
+    /// slice N+1 starts where slice N's storage ends. That is the packing
+    /// buffer→texture
+    /// blit (opcode 0x12c) reads at slices 1 and 2 of level 0 on a live x86
+    /// boot. That measurement is of level 0 only: whether slices nest inside a
+    /// level or levels inside a slice above it is not known, so a non-zero slice
+    /// of any other level is [`SliceWindowRefusal::UnmeasuredLevel`] rather
+    /// than a placement.
+    ///
+    /// The slice must be readable whole inside the declared allocation. The
+    /// descriptor's array length is not decoded, so this cannot tell a slice
+    /// past the array's end from one inside it while the allocation still has
+    /// room; it can tell one past the allocation's end, and an allocation that
+    /// declares no size bounds nothing.
+    pub fn level_slice_gva(
+        &self,
+        level: u32,
+        slice: u64,
+        page_shift: u32,
+        rows: u32,
+        tight_row: u32,
+    ) -> Result<(u64, &TextureLevelLayout), SliceWindowRefusal> {
+        let (level_gva, layout) = self
+            .level_gva(level, page_shift)
+            .ok_or(SliceWindowRefusal::NoLevel)?;
+        if slice == 0 {
+            return Ok((level_gva, layout));
+        }
+        if level != 0 {
+            return Err(SliceWindowRefusal::UnmeasuredLevel);
+        }
+        if self.allocation_size == 0 {
+            return Err(SliceWindowRefusal::UndeclaredAllocation);
+        }
+        let offset = layout
+            .row_stride
+            .checked_mul(u64::from(rows))
+            .and_then(|image| image.checked_mul(u64::from(layout.planes())))
+            .and_then(|image| image.checked_mul(slice))
+            .ok_or(SliceWindowRefusal::Overflow)?;
+        let end = layout
+            .offset
+            .checked_add(offset)
+            .and_then(|start| start.checked_add(layout.slice_read_span_rows(rows, tight_row)?))
+            .ok_or(SliceWindowRefusal::Overflow)?;
+        if end > self.allocation_size {
+            return Err(SliceWindowRefusal::PastAllocation);
+        }
+        let gva = level_gva
+            .checked_add(offset)
+            .ok_or(SliceWindowRefusal::Overflow)?;
+        Ok((gva, layout))
+    }
+}
+
+/// Why [`TextureDescriptor::level_slice_gva`] placed no slice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SliceWindowRefusal {
+    /// The level itself does not resolve (see [`TextureDescriptor::level_gva`]).
+    NoLevel,
+    /// A non-zero slice above level 0, whose packing is unmeasured.
+    UnmeasuredLevel,
+    /// A non-zero slice of a texture that declares no allocation size.
+    UndeclaredAllocation,
+    /// The slice does not fit whole inside the allocation.
+    PastAllocation,
+    /// The guest's slice index overflows the offset arithmetic.
+    Overflow,
+}
+
+impl SliceWindowRefusal {
+    /// Registered reason, for the caller's refusal.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::NoLevel => "tex_slice_no_level",
+            Self::UnmeasuredLevel => "tex_slice_unmeasured_level",
+            Self::UndeclaredAllocation => "tex_slice_undeclared_allocation",
+            Self::PastAllocation => "tex_slice_past_allocation",
+            Self::Overflow => "tex_slice_overflow",
+        }
+    }
 }
 
 /// Texture descriptor field offsets (geometry prefix + format trailer).
@@ -1105,6 +1194,20 @@ impl TextureViewDescriptor {
             self.view_opcode,
             TEXTURE_VIEW_OPCODE_RANGED | TEXTURE_VIEW_OPCODE_SWIZZLE
         )
+    }
+
+    /// The slices this view exposes, as `(base, count)` relative to its own
+    /// base texture.
+    ///
+    /// A form without a range exposes its base's first slice. A ranged form
+    /// with a zero count is read as one slice — the reading `blit_exec` has
+    /// applied to it all along — because a view of no slices is not a view the
+    /// guest could sample or copy through.
+    pub fn slice_range(&self) -> (u64, u64) {
+        if !self.carries_range() {
+            return (0, 1);
+        }
+        (self.slice_base, self.slice_count.max(1))
     }
 
     /// Whether this form carries per-channel swizzles.

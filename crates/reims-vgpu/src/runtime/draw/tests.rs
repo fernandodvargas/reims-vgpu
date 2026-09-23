@@ -5110,6 +5110,7 @@ fn texture_view_declines_are_specific_and_log_safe() {
             depth: 1,
         },
         TextureViewDecline::ChainOverflow { base: 1, depth: 8 },
+        TextureViewDecline::ChainSliceOverflow { base: 1, depth: 2 },
     ];
     let mut slugs = std::collections::HashSet::new();
     for decline in cases {
@@ -5118,7 +5119,7 @@ fn texture_view_declines_are_specific_and_log_safe() {
             assert!(!value.contains(char::is_whitespace));
         }
     }
-    assert_eq!(slugs.len(), 9);
+    assert_eq!(slugs.len(), 10);
 }
 
 #[test]

@@ -1406,6 +1406,45 @@ pub(crate) struct ComputeStorageResidencyCandidate {
     pub(crate) seed_generation: u32,
 }
 
+/// The image shape a compute texture binding is staged as.
+///
+/// Closed on what this rail can stage, so an arrayed or volume binding is not
+/// a value a caller could hand it: those stay refused by name where the
+/// shader's declaration is read (`spirv_bind::reflected_compute_texture`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ComputeTextureShape {
+    /// One `width × height` image.
+    #[default]
+    Plain2d,
+    /// Six square `width × height` faces in Metal's (and Vulkan's) layer
+    /// order, +X −X +Y −Y +Z −Z.
+    Cube,
+}
+
+impl ComputeTextureShape {
+    /// Faces of a cube. Not configurable: five is not a cube and neither is
+    /// seven.
+    pub(crate) const CUBE_FACES: u32 = 6;
+
+    /// Image layers this shape stages, face after face in `bytes`.
+    pub(crate) const fn layers(self) -> u32 {
+        match self {
+            Self::Plain2d => 1,
+            Self::Cube => Self::CUBE_FACES,
+        }
+    }
+
+    /// The protocol texture kind this shape is — the Vulkan rail's question,
+    /// which picks the view type from it.
+    #[cfg(feature = "backend-vulkan")]
+    pub(crate) const fn kind(self) -> reims_vgpu_protocol::texture_shape::TextureKind {
+        match self {
+            Self::Plain2d => reims_vgpu_protocol::texture_shape::TextureKind::D2,
+            Self::Cube => reims_vgpu_protocol::texture_shape::TextureKind::Cube,
+        }
+    }
+}
+
 pub(crate) struct StagedTexture<R: RailStage> {
     pub binding: u32,
     /// Raw Metal pixel format from the exact texture/view descriptor.
@@ -1421,8 +1460,13 @@ pub(crate) struct StagedTexture<R: RailStage> {
     /// compiler that could have answered it: both backends then matched raw
     /// integers, and the Metal one had silently been missing a member.
     pub storage_selector: Option<pixel_format::StorageImageSelector>,
+    /// Extent of one layer: for a cube, of one face.
     pub width: u32,
     pub height: u32,
+    /// How many layers `bytes` carries and how a sampler addresses them. A
+    /// cube's faces are packed tightly face after face, each one `width ×
+    /// height`, which is the order a `layerCount = 6` buffer-image copy reads.
+    pub shape: ComputeTextureShape,
     /// How many mip levels `bytes` carries, base first, packed tightly by
     /// [`reims_vgpu_protocol::extent::tight_pyramid_spans`].
     ///
@@ -1608,6 +1652,7 @@ fn stage_buffer_texture<R: RailStage, M: HostMemory + HostOps>(
         storage_selector: pixel_format::storage_selector(format),
         // A buffer-backed texture view is one level of one buffer.
         mip_levels: 1,
+        shape: ComputeTextureShape::Plain2d,
         width,
         height,
         bytes,
@@ -1627,6 +1672,18 @@ fn stage_buffer_texture<R: RailStage, M: HostMemory + HostOps>(
 /// object list (that list uses a separate texture-ref namespace — live ensure=1 then
 /// MissingTexture/GuestIo class when `resolve_mapper_ref_texture(task, sid)` hit a different
 /// mapper-ref-texture slot).
+/// Staged as the shape the shader declares for this binding: every rail but
+/// the Vulkan one, and every Vulkan binding but a cube, passes
+/// [`ComputeTextureShape::Plain2d`].
+///
+/// A cube is staged from a linear texture only. Its six faces are contiguous
+/// images one face-stride apart — the packing
+/// [`TextureDescriptor::level_slice_gva`] places — so over guest memory a cube
+/// *is* one `width × 6·height` linear window, and the read, the surface cache,
+/// the page walk and the writeback below serve it unchanged. What differs is
+/// only what the rail builds from the bytes: six layers, not one tall image.
+///
+/// [`TextureDescriptor::level_slice_gva`]: crate::runtime::decode::resource::TextureDescriptor::level_slice_gva
 pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1634,6 +1691,7 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
     texture_ref: u32,
     binding: u32,
     is_storage: bool,
+    shape: ComputeTextureShape,
 ) -> Result<StagedTexture<R>, ComputeStatus> {
     // Ref-texture RefTextureHandle → surface_id (live CI binds ot5).
     let mut stage_ref = texture_ref;
@@ -1641,6 +1699,8 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
     let mut from_backing_direct = false;
     let mut ref_texture_record: Option<objects::RefTextureView> = None;
     let mut view_level = 0;
+    // The one slice of the base a view names; 0 for a bind that is no view.
+    let mut view_slice = 0u64;
     let mut view_pixel_format = None;
     let mut heap_texture = None;
     let mut buffer_texture: Option<crate::runtime::decode::resource::BufferTextureDescriptor> =
@@ -1783,11 +1843,41 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
                         "compute_view_swizzle_unsupported",
                     ));
                 }
+                // More slices than the shape has is an arrayed image, which
+                // this rail does not build: narrowing the view to its first
+                // slice would hand the kernel the wrong texels for every other.
+                // A cube view exposes exactly its six faces.
+                if view.slice_count != u64::from(shape.layers()) {
+                    crate::observe::fail(format!(
+                        "compute_stage_tex view_fail reason=slice_range ref={texture_ref} base={} slice_base={} slice_count={} shape={shape:?} storage={}",
+                        view.base_texture_ref, view.slice_base, view.slice_count, is_storage as u8
+                    ));
+                    return Err(ComputeStatus::Unsupported("compute_view_slice_range"));
+                }
                 stage_ref = view.base_texture_ref;
                 view_level = view.level;
+                view_slice = view.slice_base;
                 view_pixel_format = view.pixel_format;
             }
         }
+    }
+    // A cube's only staged source is a linear texture's contiguous faces.
+    let refuse_cube_source = |source: &'static str, base: u32| {
+        crate::observe::fail(format!(
+            "compute_stage_tex cube_fail reason=source_{source} ref={texture_ref} base={base} storage={}",
+            is_storage as u8
+        ));
+        Err(ComputeStatus::Unsupported("compute_cube_source"))
+    };
+    if shape == ComputeTextureShape::Cube && (buffer_texture.is_some() || heap_texture.is_some()) {
+        return refuse_cube_source(
+            if buffer_texture.is_some() {
+                "buffer_texture"
+            } else {
+                "heap_texture"
+            },
+            stage_ref,
+        );
     }
     if let Some(bt) = buffer_texture {
         return stage_buffer_texture(state, host, task_id, texture_ref, binding, is_storage, &bt);
@@ -1879,6 +1969,7 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
             // The heap arm refuses a descriptor declaring more than one level
             // above, so a heap texture reaching here is single-level.
             mip_levels: 1,
+            shape: ComputeTextureShape::Plain2d,
             width,
             height,
             bytes: vec![0; need],
@@ -1996,6 +2087,18 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
             ));
             return Err(ComputeStatus::Unsupported(
                 "compute_view_mapper_ref_texture_mip",
+            ));
+        }
+        if shape == ComputeTextureShape::Cube {
+            return refuse_cube_source("surface", stage_ref);
+        }
+        // A surface window is one image; there is no slice past the first.
+        if view_slice != 0 {
+            crate::observe::fail(format!(
+                "compute_stage_tex view_fail reason=mapper_ref_texture_slice ref={texture_ref} base={stage_ref} slice={view_slice} mapping={mapping_id}"
+            ));
+            return Err(ComputeStatus::Unsupported(
+                "compute_view_mapper_ref_texture_slice",
             ));
         }
         let (width, height, format) = if from_ref_texture || from_backing_direct {
@@ -2340,6 +2443,7 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
             storage_selector,
             // Metal forbids a mipmapped IOSurface texture.
             mip_levels: 1,
+            shape: ComputeTextureShape::Plain2d,
             width,
             height,
             bytes,
@@ -2462,6 +2566,93 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
             format!("stride={} tight={tight} {w}x{h}", layout.row_stride),
         );
     }
+    // The slice a view names. Every read and the writeback below take this
+    // address, so staging and writing back cannot disagree about the slice.
+    let gva = if view_slice == 0 {
+        gva
+    } else {
+        match u32::try_from(tight)
+            .ok()
+            .zip(pixel_format::tight_row_count(h, stage_format))
+            .map(|(tight_row, rows)| {
+                tex.level_slice_gva(view_level, view_slice, state.page_shift, rows, tight_row)
+            }) {
+            Some(Ok((slice_gva, _))) => slice_gva,
+            Some(Err(refusal)) => {
+                return linear_fail(
+                    ComputeStatus::Unsupported(refusal.slug()),
+                    format!(
+                        "base={stage_ref} level={view_level} slice={view_slice} alloc={} {w}x{h} stride={}",
+                        tex.allocation_size, layout.row_stride
+                    ),
+                );
+            }
+            None => {
+                return linear_fail(
+                    ComputeStatus::Unsupported("linear_tex_tight_overflow"),
+                    format!("{w}x{h} bpp={bpp}"),
+                );
+            }
+        }
+    };
+    // A cube, from here on, is the `w × 6h` window its six contiguous faces
+    // make; `face_h` keeps one face's extent for the image the rail builds.
+    let face_h = h;
+    let h = match shape {
+        ComputeTextureShape::Plain2d => h,
+        ComputeTextureShape::Cube => {
+            let cube_fail = |reason: &'static str, status: &'static str| {
+                linear_fail(
+                    ComputeStatus::Unsupported(status),
+                    format!(
+                        "cube={reason} base={stage_ref} level={view_level} slice={view_slice} levels={} {w}x{h} stride={} alloc={}",
+                        tex.levels.len(),
+                        layout.row_stride,
+                        tex.allocation_size
+                    ),
+                )
+            };
+            if w != h {
+                return cube_fail("not_square", "compute_cube_not_square");
+            }
+            // Faces past level 0 are placed by an unmeasured rule, and a
+            // sampled cube with a chain would be sampled at LODs this image
+            // does not hold. Both stay refused until the layout is measured.
+            if view_level != 0 {
+                return cube_fail("level", "compute_cube_level");
+            }
+            if tex.levels.len() > 1 {
+                return cube_fail("mip_chain", "compute_cube_mip_chain");
+            }
+            // The window is one run of rows only if a face is exactly its
+            // rows: true for every format this rail stages, and checked
+            // rather than assumed.
+            let Some(rows) = pixel_format::tight_row_count(h, stage_format) else {
+                return cube_fail("row_count", "compute_cube_row_count");
+            };
+            if rows != h || layout.planes() != 1 {
+                return cube_fail("face_rows", "compute_cube_face_rows");
+            }
+            // The last face must lie whole inside the allocation; the faces
+            // before it then do too.
+            let last_face = view_slice.checked_add(u64::from(ComputeTextureShape::CUBE_FACES - 1));
+            let placed = u32::try_from(tight)
+                .ok()
+                .zip(last_face)
+                .map(|(tight_row, last)| {
+                    tex.level_slice_gva(0, last, state.page_shift, rows, tight_row)
+                });
+            match placed {
+                Some(Ok(_)) => {}
+                Some(Err(refusal)) => return cube_fail("last_face", refusal.slug()),
+                None => return cube_fail("last_face", "tex_slice_overflow"),
+            }
+            match h.checked_mul(ComputeTextureShape::CUBE_FACES) {
+                Some(window_h) => window_h,
+                None => return cube_fail("window", "compute_cube_window_overflow"),
+            }
+        }
+    };
     let Some(need) = tight.checked_mul(h as usize) else {
         return linear_fail(
             ComputeStatus::Unsupported("linear_tex_need_overflow"),
@@ -2479,7 +2670,9 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
         gva,
         row_stride: layout.row_stride,
     }];
-    if !is_storage && view_level == 0 {
+    // A slice's own pyramid is unmeasured (see
+    // `TextureDescriptor::level_slice_gva`), so a sliced view stages its base.
+    if !is_storage && view_level == 0 && view_slice == 0 {
         level_sources.extend(linear_extra_levels(
             &tex,
             state.page_shift,
@@ -2545,18 +2738,22 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
     // entry exactly. Absent when the stride overflows the key field (no live
     // class; such a window simply stays on the bytes path).
     let span = layout.row_stride.saturating_mul(h as u64);
-    let linear_key = (layout.row_stride <= u32::MAX as u64).then(|| {
-        crate::model::ComputeStorageResidencyKey::linear(
-            task_id,
-            stage_ref,
-            gva,
-            layout.row_stride as u32,
-            span,
-            w,
-            h,
-            stage_format,
-        )
-    });
+    // A resident is one 2D image; the rail keeps no cube resident, so a cube
+    // has no residency identity and always takes the bytes path.
+    let linear_key = (layout.row_stride <= u32::MAX as u64
+        && shape == ComputeTextureShape::Plain2d)
+        .then(|| {
+            crate::model::ComputeStorageResidencyKey::linear(
+                task_id,
+                stage_ref,
+                gva,
+                layout.row_stride as u32,
+                span,
+                w,
+                h,
+                stage_format,
+            )
+        });
     let mut bytes = vec![0u8; pyramid_need];
     // Resident-authoritative window (deferred linear writeback): consume the
     // rail's resident without bytes when possible; otherwise flush it into the
@@ -2665,8 +2862,9 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
         // descriptor places all of them and a reported-short prefix when it
         // does not.
         mip_levels: level_sources.len() as u32,
+        shape,
         width: w,
-        height: h,
+        height: face_h,
         bytes,
         is_storage,
         writeback,

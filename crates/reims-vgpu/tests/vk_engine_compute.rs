@@ -12,7 +12,7 @@
 use reims_vgpu::backend::vulkan::engine::{
     self, ComputeBufferResource, ComputeRequest, ComputeResidentSampleBind,
     ComputeSampledImageResource, ComputeSampledSource, ComputeStorageImageResource,
-    ComputeStorageResidency, StorageImageFormat,
+    ComputeStorageResidency, ComputeTextureShape, StorageImageFormat,
 };
 use reims_vgpu::model::ComputeStorageResidencyKey;
 
@@ -524,6 +524,7 @@ fn compute_storage_image_rgba8unorm_known_result() {
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
+            shape: ComputeTextureShape::Plain2d,
             bytes: seed.clone(),
             residency: Some(ComputeStorageResidency {
                 identity,
@@ -573,6 +574,7 @@ fn compute_storage_image_rgba8unorm_known_result() {
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
+            shape: ComputeTextureShape::Plain2d,
             bytes: resident_seed.clone(),
             residency: Some(ComputeStorageResidency {
                 identity,
@@ -613,6 +615,7 @@ fn compute_storage_image_rgba8unorm_known_result() {
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
+            shape: ComputeTextureShape::Plain2d,
             bytes: seed.clone(),
             residency: Some(ComputeStorageResidency {
                 identity,
@@ -707,6 +710,7 @@ fn every_admitted_compute_storage_resident_survives_past_the_retired_slot_cap() 
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
+            shape: ComputeTextureShape::Plain2d,
             bytes: seed.clone(),
             residency: Some(ComputeStorageResidency {
                 identity: identity(i),
@@ -799,6 +803,7 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
             format: StorageImageFormat::Bgra8Unorm,
             width: w,
             height: h,
+            shape: ComputeTextureShape::Plain2d,
             bytes: seed,
             residency: Some(ComputeStorageResidency {
                 identity,
@@ -868,6 +873,7 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
                 format: StorageImageFormat::Rgba8Unorm,
                 width: w,
                 height: h,
+                shape: ComputeTextureShape::Plain2d,
                 bytes: vec![0u8; (w * h * 4) as usize],
                 residency: Some(ComputeStorageResidency {
                     identity,
@@ -968,6 +974,7 @@ fn compute_sampled_resident_copy_and_lost_resident() {
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
+            shape: ComputeTextureShape::Plain2d,
             bytes: vec![0u8; (w * h * 4) as usize],
             residency: Some(ComputeStorageResidency {
                 identity,
@@ -1003,6 +1010,7 @@ fn compute_sampled_resident_copy_and_lost_resident() {
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
+            shape: ComputeTextureShape::Plain2d,
             source: ComputeSampledSource::ResidentCopy(ComputeResidentSampleBind {
                 identity,
                 generation,
@@ -1088,6 +1096,7 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
             format: StorageImageFormat::Rgba32Float,
             width: 1,
             height: 1,
+            shape: ComputeTextureShape::Plain2d,
             source: ComputeSampledSource::Bytes(bytes),
         }],
         samplers: vec![],
@@ -1309,6 +1318,7 @@ fn compute_storage_image_r16float_if_supported() {
             format: StorageImageFormat::R16Float,
             width: 2,
             height: 2,
+            shape: ComputeTextureShape::Plain2d,
             bytes: seed,
             residency: None,
             seed_skipped: false,
@@ -1491,6 +1501,7 @@ fn compute_sampled_image_serves_every_declared_mip_level() {
                 format: StorageImageFormat::Rgba8Unorm,
                 width: BASE,
                 height: BASE,
+                shape: ComputeTextureShape::Plain2d,
                 mip_levels: LEVELS,
                 source: ComputeSampledSource::Bytes(bytes.clone()),
             }],
@@ -1543,6 +1554,7 @@ fn compute_sampled_resident_bind_refuses_a_pyramid() {
             format: StorageImageFormat::Rgba8Unorm,
             width: 8,
             height: 8,
+            shape: ComputeTextureShape::Plain2d,
             mip_levels: 4,
             source: ComputeSampledSource::ResidentCopy(ComputeResidentSampleBind {
                 identity: ComputeStorageResidencyKey {
@@ -1610,6 +1622,7 @@ fn compute_sampled_a8unorm_arrives_in_alpha() {
             format: StorageImageFormat::A8Unorm,
             width: w,
             height: h,
+            shape: ComputeTextureShape::Plain2d,
             mip_levels: 1,
             source: ComputeSampledSource::Bytes(vec![BYTE; (w * h) as usize]),
         }],
@@ -1706,4 +1719,285 @@ fn a_repeat_arm_through_a_warm_slot_does_not_enter_the_allocator() {
         drop(arm_compute_engine_stall_watchdog(pipe, &req, far));
     });
     assert_eq!(trips, 0, "arming a warm slot allocated {trips} time(s)");
+}
+
+/// Six fetch-free samples of a cube at the centre of each face, in Metal's
+/// face order, each face's red channel stored to `out[face]` as float bits.
+///
+/// Sampled at the face centre so the answer does not depend on how a device
+/// filters across a cube's seams: a uniform face reads its own value there
+/// under nearest and linear alike.
+const SAMPLED_CUBE_FACES_KERNEL: &str = r#"
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %out %cube_var %sampler_var
+               OpExecutionMode %main LocalSize 1 1 1
+               OpDecorate %out DescriptorSet 0
+               OpDecorate %out Binding 0
+               OpDecorate %cube_var DescriptorSet 0
+               OpDecorate %cube_var Binding 32
+               OpDecorate %sampler_var DescriptorSet 0
+               OpDecorate %sampler_var Binding 64
+               OpDecorate %Out Block
+               OpMemberDecorate %Out 0 Offset 0
+               OpDecorate %OutWords ArrayStride 4
+       %void = OpTypeVoid
+       %uint = OpTypeInt 32 0
+      %float = OpTypeFloat 32
+    %v3float = OpTypeVector %float 3
+    %v4float = OpTypeVector %float 4
+     %uint_0 = OpConstant %uint 0
+     %uint_1 = OpConstant %uint 1
+     %uint_2 = OpConstant %uint 2
+     %uint_3 = OpConstant %uint 3
+     %uint_4 = OpConstant %uint 4
+     %uint_5 = OpConstant %uint 5
+    %float_0 = OpConstant %float 0
+    %float_1 = OpConstant %float 1
+   %float_m1 = OpConstant %float -1
+     %dir_px = OpConstantComposite %v3float %float_1 %float_0 %float_0
+     %dir_nx = OpConstantComposite %v3float %float_m1 %float_0 %float_0
+     %dir_py = OpConstantComposite %v3float %float_0 %float_1 %float_0
+     %dir_ny = OpConstantComposite %v3float %float_0 %float_m1 %float_0
+     %dir_pz = OpConstantComposite %v3float %float_0 %float_0 %float_1
+     %dir_nz = OpConstantComposite %v3float %float_0 %float_0 %float_m1
+   %OutWords = OpTypeRuntimeArray %uint
+        %Out = OpTypeStruct %OutWords
+%_ptr_StorageBuffer_Out = OpTypePointer StorageBuffer %Out
+%_ptr_StorageBuffer_uint = OpTypePointer StorageBuffer %uint
+        %out = OpVariable %_ptr_StorageBuffer_Out StorageBuffer
+       %Cube = OpTypeImage %float Cube 0 0 0 1 Unknown
+    %Sampler = OpTypeSampler
+  %SampledCube = OpTypeSampledImage %Cube
+%_ptr_UniformConstant_Cube = OpTypePointer UniformConstant %Cube
+%_ptr_UniformConstant_Sampler = OpTypePointer UniformConstant %Sampler
+   %cube_var = OpVariable %_ptr_UniformConstant_Cube UniformConstant
+%sampler_var = OpVariable %_ptr_UniformConstant_Sampler UniformConstant
+    %fn_type = OpTypeFunction %void
+       %main = OpFunction %void None %fn_type
+      %entry = OpLabel
+     %cube_v = OpLoad %Cube %cube_var
+      %smp_v = OpLoad %Sampler %sampler_var
+         %si = OpSampledImage %SampledCube %cube_v %smp_v
+         %t0 = OpImageSampleExplicitLod %v4float %si %dir_px Lod %float_0
+         %t1 = OpImageSampleExplicitLod %v4float %si %dir_nx Lod %float_0
+         %t2 = OpImageSampleExplicitLod %v4float %si %dir_py Lod %float_0
+         %t3 = OpImageSampleExplicitLod %v4float %si %dir_ny Lod %float_0
+         %t4 = OpImageSampleExplicitLod %v4float %si %dir_pz Lod %float_0
+         %t5 = OpImageSampleExplicitLod %v4float %si %dir_nz Lod %float_0
+         %r0 = OpCompositeExtract %float %t0 0
+         %r1 = OpCompositeExtract %float %t1 0
+         %r2 = OpCompositeExtract %float %t2 0
+         %r3 = OpCompositeExtract %float %t3 0
+         %r4 = OpCompositeExtract %float %t4 0
+         %r5 = OpCompositeExtract %float %t5 0
+         %b0 = OpBitcast %uint %r0
+         %b1 = OpBitcast %uint %r1
+         %b2 = OpBitcast %uint %r2
+         %b3 = OpBitcast %uint %r3
+         %b4 = OpBitcast %uint %r4
+         %b5 = OpBitcast %uint %r5
+         %p0 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_0
+               OpStore %p0 %b0
+         %p1 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_1
+               OpStore %p1 %b1
+         %p2 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_2
+               OpStore %p2 %b2
+         %p3 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_3
+               OpStore %p3 %b3
+         %p4 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_4
+               OpStore %p4 %b4
+         %p5 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_5
+               OpStore %p5 %b5
+               OpReturn
+               OpFunctionEnd
+"#;
+
+/// Writes every texel of a storage cube with a value that names its face:
+/// red = (16 + 32·face) / 255, over a `side × side × 6` grid whose z is the
+/// face, so a face written into the wrong layer reads as its neighbour.
+const STORAGE_CUBE_FACES_KERNEL: &str = r#"
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %gid %img
+               OpExecutionMode %main LocalSize 1 1 1
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %img DescriptorSet 0
+               OpDecorate %img Binding 0
+               OpDecorate %img NonReadable
+       %void = OpTypeVoid
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+      %float = OpTypeFloat 32
+     %v3uint = OpTypeVector %uint 3
+      %v3int = OpTypeVector %int 3
+    %v4float = OpTypeVector %float 4
+    %float_0 = OpConstant %float 0
+    %float_1 = OpConstant %float 1
+   %float_16 = OpConstant %float 16
+   %float_32 = OpConstant %float 32
+  %float_255 = OpConstant %float 255
+     %img_ty = OpTypeImage %float Cube 0 0 0 2 Rgba8
+   %_ptr_img = OpTypePointer UniformConstant %img_ty
+        %img = OpVariable %_ptr_img UniformConstant
+%_ptr_Input_v3uint = OpTypePointer Input %v3uint
+        %gid = OpVariable %_ptr_Input_v3uint Input
+    %fn_type = OpTypeFunction %void
+       %main = OpFunction %void None %fn_type
+      %entry = OpLabel
+    %gid_val = OpLoad %v3uint %gid
+      %coord = OpBitcast %v3int %gid_val
+       %face = OpCompositeExtract %uint %gid_val 2
+      %facef = OpConvertUToF %float %face
+     %scaled = OpFMul %float %facef %float_32
+      %level = OpFAdd %float %scaled %float_16
+        %red = OpFDiv %float %level %float_255
+      %texel = OpCompositeConstruct %v4float %red %float_0 %float_0 %float_1
+      %img_l = OpLoad %img_ty %img
+               OpImageWrite %img_l %coord %texel
+               OpReturn
+               OpFunctionEnd
+"#;
+
+/// A sampled cube is six layers in Metal's face order behind a cube view.
+///
+/// Each face is a uniform marker, so sampling the centre of face N must return
+/// face N's marker — a cube staged as one tall 2D image, as six layers under a
+/// 2D-array view, or with its faces out of order reads as a neighbour's.
+#[test]
+fn compute_sampled_cube_serves_each_face_in_metal_order() {
+    let _g = engine_test_session();
+    const SIDE: u32 = 4;
+    let marker = |face: u32| (0x10 + face * 0x20) as u8;
+    let Some(words) = assemble_spvasm(SAMPLED_CUBE_FACES_KERNEL, "sampled_cube_faces") else {
+        return;
+    };
+    let mut bytes = Vec::new();
+    for face in 0..6 {
+        bytes.extend(std::iter::repeat_n(
+            marker(face),
+            (SIDE * SIDE * 4) as usize,
+        ));
+    }
+    let req = ComputeRequest {
+        spirv: words,
+        entry: "main".into(),
+        dispatch: engine::ComputeDispatch::Workgroups([1, 1, 1]),
+        storage_buffers: vec![ComputeBufferResource {
+            binding: 0,
+            bytes: vec![0; 6 * 4],
+            writable: true,
+        }],
+        sampled_images: vec![ComputeSampledImageResource {
+            binding: 32,
+            array_element: 0,
+            descriptor_count: 1,
+            format: StorageImageFormat::Rgba8Unorm,
+            width: SIDE,
+            height: SIDE,
+            shape: ComputeTextureShape::Cube,
+            mip_levels: 1,
+            source: ComputeSampledSource::Bytes(bytes),
+        }],
+        samplers: vec![engine::SamplerResource::normalized_default(64)],
+        storage_images: vec![],
+    };
+    let Some(out) = engine_or_skip("sampled_cube_faces", &req) else {
+        return;
+    };
+    for (face, word) in out.buffers[0].bytes.chunks_exact(4).enumerate() {
+        let got = f32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+        let want = f32::from(marker(face as u32)) / 255.0;
+        assert!(
+            (got - want).abs() < 1.0 / 255.0,
+            "face {face}: got {got}, want {want} (marker {:#04x})",
+            marker(face as u32)
+        );
+    }
+}
+
+/// A storage cube is written per face and read back face after face, in the
+/// order its seed was uploaded and the guest's slices are laid out.
+#[test]
+fn compute_storage_cube_writes_back_each_face_in_order() {
+    let _g = engine_test_session();
+    const SIDE: u32 = 4;
+    let Some(words) = assemble_spvasm(STORAGE_CUBE_FACES_KERNEL, "storage_cube_faces") else {
+        return;
+    };
+    let req = ComputeRequest {
+        spirv: words,
+        entry: "main".into(),
+        dispatch: engine::ComputeDispatch::Workgroups([SIDE, SIDE, 6]),
+        storage_buffers: vec![],
+        sampled_images: vec![],
+        samplers: vec![],
+        storage_images: vec![ComputeStorageImageResource {
+            binding: 0,
+            array_element: 0,
+            descriptor_count: 1,
+            format: StorageImageFormat::Rgba8Unorm,
+            width: SIDE,
+            height: SIDE,
+            shape: ComputeTextureShape::Cube,
+            bytes: vec![0; (6 * SIDE * SIDE * 4) as usize],
+            destination: engine::ComputeImageDestination::Host,
+            residency: None,
+            seed_skipped: false,
+        }],
+    };
+    let Some(out) = engine_or_skip("storage_cube_faces", &req) else {
+        return;
+    };
+    let image = out.images[0]
+        .bytes()
+        .expect("a Host destination reads bytes back");
+    assert_eq!(image.len(), (6 * SIDE * SIDE * 4) as usize);
+    for (face, texels) in image.chunks_exact((SIDE * SIDE * 4) as usize).enumerate() {
+        let want = (16 + 32 * face) as u8;
+        for texel in texels.chunks_exact(4) {
+            assert!(
+                texel[0].abs_diff(want) <= 1 && texel[3] == 0xff,
+                "face {face}: texel {texel:?}, want red {want:#04x}"
+            );
+        }
+    }
+}
+
+/// A cube the engine could not build as one is refused before any GPU work,
+/// each by its own reason.
+#[test]
+fn a_cube_request_the_engine_cannot_build_is_refused_by_name() {
+    let _g = engine_test_session();
+    let sampled = |width: u32, height: u32, mip_levels: u32| ComputeRequest {
+        spirv: vec![0x0723_0203],
+        entry: "main".into(),
+        dispatch: engine::ComputeDispatch::Workgroups([1, 1, 1]),
+        storage_buffers: vec![],
+        sampled_images: vec![ComputeSampledImageResource {
+            binding: 32,
+            array_element: 0,
+            descriptor_count: 1,
+            format: StorageImageFormat::Rgba8Unorm,
+            width,
+            height,
+            shape: ComputeTextureShape::Cube,
+            mip_levels,
+            source: ComputeSampledSource::Bytes(vec![0; (6 * width * height * 4) as usize]),
+        }],
+        samplers: vec![],
+        storage_images: vec![],
+    };
+    let refused = |req: &ComputeRequest| match engine::execute_compute_request(engine_device(), req)
+    {
+        Ok(_) => panic!("a cube the engine cannot build was accepted"),
+        Err(e) => e.to_string(),
+    };
+    let not_square = refused(&sampled(4, 2, 1));
+    assert!(
+        not_square.contains("vk_compute_validate_cube_not_square"),
+        "{not_square}"
+    );
+    let chain = refused(&sampled(4, 4, 3));
+    assert!(chain.contains("vk_compute_validate_cube_levels"), "{chain}");
 }

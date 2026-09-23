@@ -255,9 +255,16 @@ fn stage_texture_ref_texture_plane_index_beats_the_ambiguous_geometry_scan() {
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let staged =
-        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, ref_texture_ref, 33, true)
-            .expect("a ref-texture plane view over a mapped surface must stage");
+    let staged = stage_texture_raw::<NeutralStage, _>(
+        &mut state,
+        &mut host,
+        1,
+        ref_texture_ref,
+        33,
+        true,
+        crate::runtime::compute_exec::ComputeTextureShape::Plain2d,
+    )
+    .expect("a ref-texture plane view over a mapped surface must stage");
     match staged.writeback {
         TextureWriteback::MapperRefTexture {
             surface_offset,
@@ -941,6 +948,7 @@ fn a_format_with_no_storage_selector_refuses_the_same_way_from_every_rail() {
         pixel_format: crate::protocol::pixel_format::MTL_FORMAT_R32_FLOAT,
         storage_selector: None,
         mip_levels: 1,
+        shape: ComputeTextureShape::Plain2d,
         width: 4,
         height: 4,
         bytes: vec![0; 64],
@@ -1174,9 +1182,16 @@ fn stage_texture_ref_texture_ref_resolves_surface_mapping() {
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let staged =
-        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, ref_texture_ref, 32, true)
-            .expect("ref-texture→surface stage must succeed after ensure");
+    let staged = stage_texture_raw::<NeutralStage, _>(
+        &mut state,
+        &mut host,
+        1,
+        ref_texture_ref,
+        32,
+        true,
+        crate::runtime::compute_exec::ComputeTextureShape::Plain2d,
+    )
+    .expect("ref-texture→surface stage must succeed after ensure");
     assert_eq!((staged.width, staged.height), (4, 4));
     assert_eq!(staged.bytes.len(), 4 * 4 * 4);
     assert!(matches!(
@@ -1232,9 +1247,16 @@ fn stage_texture_ref_texture_record_reshapes_stageable_single_plane_surface() {
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let staged =
-        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, ref_texture_ref, 33, true)
-            .expect("serialized ref-texture view must override base surface geometry");
+    let staged = stage_texture_raw::<NeutralStage, _>(
+        &mut state,
+        &mut host,
+        1,
+        ref_texture_ref,
+        33,
+        true,
+        crate::runtime::compute_exec::ComputeTextureShape::Plain2d,
+    )
+    .expect("serialized ref-texture view must override base surface geometry");
     assert_eq!((staged.width, staged.height), (1, 4));
     assert_eq!(
         staged.storage_selector,
@@ -1269,9 +1291,16 @@ fn stage_texture_ref_texture_record_reshapes_stageable_single_plane_surface() {
         .geometry(MTL_FORMAT_R32_UINT, 4, 4, 1)
         .trailer([1, 0, 1, 0, 1, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, reshaped.bytes());
-    let sampled =
-        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, ref_texture_ref, 32, false)
-            .expect("sample-only R32Uint view must stage from the same IOSurface bytes");
+    let sampled = stage_texture_raw::<NeutralStage, _>(
+        &mut state,
+        &mut host,
+        1,
+        ref_texture_ref,
+        32,
+        false,
+        crate::runtime::compute_exec::ComputeTextureShape::Plain2d,
+    )
+    .expect("sample-only R32Uint view must stage from the same IOSurface bytes");
     assert_eq!((sampled.width, sampled.height), (4, 4));
     assert_eq!(sampled.pixel_format, MTL_FORMAT_R32_UINT);
     assert_eq!(
@@ -1359,9 +1388,16 @@ fn stage_texture_ref_texture_record_stages_biplanar_y_plane() {
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let staged =
-        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, ref_texture_ref, 32, true)
-            .expect("plane record must stage the Y plane of a biplanar surface");
+    let staged = stage_texture_raw::<NeutralStage, _>(
+        &mut state,
+        &mut host,
+        1,
+        ref_texture_ref,
+        32,
+        true,
+        crate::runtime::compute_exec::ComputeTextureShape::Plain2d,
+    )
+    .expect("plane record must stage the Y plane of a biplanar surface");
     assert_eq!((staged.width, staged.height), (16, 8));
     assert_eq!(
         staged.storage_selector,
@@ -1382,9 +1418,16 @@ fn stage_texture_ref_texture_record_stages_biplanar_y_plane() {
         }
         _ => panic!("expected MapperRefTexture writeback"),
     }
-    let sampled =
-        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, ref_texture_ref, 32, false)
-            .expect("sampled ref-texture plane must stage without writeback");
+    let sampled = stage_texture_raw::<NeutralStage, _>(
+        &mut state,
+        &mut host,
+        1,
+        ref_texture_ref,
+        32,
+        false,
+        crate::runtime::compute_exec::ComputeTextureShape::Plain2d,
+    )
+    .expect("sampled ref-texture plane must stage without writeback");
     assert!(!sampled.is_storage);
     assert!(matches!(sampled.writeback, TextureWriteback::None));
     let _ = MTL_FORMAT_R8_UNORM;
@@ -1437,8 +1480,15 @@ fn stage_texture_ref_texture_multiplanar_without_record_fails_closed() {
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    match stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, ref_texture_ref, 32, true)
-    {
+    match stage_texture_raw::<NeutralStage, _>(
+        &mut state,
+        &mut host,
+        1,
+        ref_texture_ref,
+        32,
+        true,
+        crate::runtime::compute_exec::ComputeTextureShape::Plain2d,
+    ) {
         Err(ComputeStatus::Unsupported(_)) => {}
         Err(other) => panic!("expected Unsupported, got {other:?}"),
         Ok(_) => panic!("multiplanar without plane record must fail closed"),
@@ -1488,9 +1538,15 @@ fn stage_texture_linear_ref_does_not_collide_with_surface_mid() {
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     // Must fail linear (bogus desc), NOT succeed against surface mid 7.
-    if let Ok(s) =
-        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, colliding_mid, 32, true)
-    {
+    if let Ok(s) = stage_texture_raw::<NeutralStage, _>(
+        &mut state,
+        &mut host,
+        1,
+        colliding_mid,
+        32,
+        true,
+        crate::runtime::compute_exec::ComputeTextureShape::Plain2d,
+    ) {
         panic!(
             "linear ref must not stage collided surface mid ({}x{})",
             s.width, s.height
@@ -1613,6 +1669,7 @@ fn stage_heap_texture_uses_host_only_residency_identity() {
         texture_ref,
         33,
         true,
+        crate::runtime::compute_exec::ComputeTextureShape::Plain2d,
     )
     .expect("live opcode-0x15 heap texture must stage");
     assert_eq!((staged.width, staged.height), (180, 135));
@@ -1652,6 +1709,7 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
     let rgba = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
     let staged = StagedTexture {
         mip_levels: 1,
+        shape: ComputeTextureShape::Plain2d,
         binding: 32,
         rail: vulkan::VulkanStage::default(),
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
@@ -1769,9 +1827,16 @@ fn stage_texture_ref_texture_ignores_task_object_list_slot_collision() {
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let staged =
-        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, ref_texture_ref, 32, true)
-            .expect("ref-texture must stage mapping sid, not poisoned mapper-ref-texture slot");
+    let staged = stage_texture_raw::<NeutralStage, _>(
+        &mut state,
+        &mut host,
+        1,
+        ref_texture_ref,
+        32,
+        true,
+        crate::runtime::compute_exec::ComputeTextureShape::Plain2d,
+    )
+    .expect("ref-texture must stage mapping sid, not poisoned mapper-ref-texture slot");
     assert_eq!((staged.width, staged.height), (4, 4));
     assert!(matches!(
         staged.writeback,
@@ -1803,8 +1868,15 @@ fn stage_texture_ref_texture_without_surface_is_missing() {
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let st =
-        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, ref_texture_ref, 32, false);
+    let st = stage_texture_raw::<NeutralStage, _>(
+        &mut state,
+        &mut host,
+        1,
+        ref_texture_ref,
+        32,
+        false,
+        crate::runtime::compute_exec::ComputeTextureShape::Plain2d,
+    );
     assert!(matches!(st, Err(ComputeStatus::MissingTexture(_))));
 }
 
@@ -2386,6 +2458,7 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
     };
     let staged = |writeback, residency| StagedTexture {
         mip_levels: 1,
+        shape: ComputeTextureShape::Plain2d,
         binding: 32,
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
         storage_selector: Some(pixel_format::StorageImageSelector::Rgba8Unorm),
@@ -2754,6 +2827,7 @@ fn a_heap_texture_mirror_outlives_the_per_mapping_cap() {
 
     let staged = |key: ComputeStorageResidencyKey| StagedTexture {
         mip_levels: 1,
+        shape: ComputeTextureShape::Plain2d,
         binding: 33,
         pixel_format: key.pixel_format,
         storage_selector: Some(pixel_format::StorageImageSelector::Rgba8Uint),
@@ -2995,8 +3069,16 @@ fn a_buffer_backed_texture_stages_its_texels_without_the_row_padding() {
         write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
     }
 
-    let staged = stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, 21, 0, false)
-        .expect("a buffer-backed texture is a wire form this device decodes");
+    let staged = stage_texture_raw::<NeutralStage, _>(
+        &mut state,
+        &mut host,
+        1,
+        21,
+        0,
+        false,
+        crate::runtime::compute_exec::ComputeTextureShape::Plain2d,
+    )
+    .expect("a buffer-backed texture is a wire form this device decodes");
 
     assert_eq!(staged.width, W_TEXELS as u32);
     assert_eq!(staged.height, H_ROWS as u32);
@@ -3026,7 +3108,15 @@ fn a_buffer_backed_texture_stages_its_texels_without_the_row_padding() {
     // The destination half is a separate contract with no evidence behind it,
     // so a writable binding of the same record still refuses, under its own
     // name rather than the retired blanket one.
-    match stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, 21, 0, true) {
+    match stage_texture_raw::<NeutralStage, _>(
+        &mut state,
+        &mut host,
+        1,
+        21,
+        0,
+        true,
+        crate::runtime::compute_exec::ComputeTextureShape::Plain2d,
+    ) {
         Err(ComputeStatus::Unsupported(slug)) => {
             assert_eq!(slug, "compute_buffer_texture_storage_unsupported")
         }
@@ -3144,8 +3234,16 @@ fn a_declared_mip_chain_stages_every_level_and_not_only_its_base() {
         write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
     }
 
-    let staged = stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, 11, 0, false)
-        .expect("a declared mip chain is a wire form this device decodes");
+    let staged = stage_texture_raw::<NeutralStage, _>(
+        &mut state,
+        &mut host,
+        1,
+        11,
+        0,
+        false,
+        crate::runtime::compute_exec::ComputeTextureShape::Plain2d,
+    )
+    .expect("a declared mip chain is a wire form this device decodes");
 
     assert_eq!(staged.width, BASE);
     assert_eq!(staged.height, BASE);
@@ -3178,8 +3276,16 @@ fn a_declared_mip_chain_stages_every_level_and_not_only_its_base() {
 
     // A storage binding of the same texture stays at the base: a compute write
     // names one level, and the writeback window describes one.
-    let written = stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, 11, 0, true)
-        .expect("the same texture stages as a storage destination");
+    let written = stage_texture_raw::<NeutralStage, _>(
+        &mut state,
+        &mut host,
+        1,
+        11,
+        0,
+        true,
+        crate::runtime::compute_exec::ComputeTextureShape::Plain2d,
+    )
+    .expect("the same texture stages as a storage destination");
     assert_eq!(
         written.mip_levels, 1,
         "a storage binding is one level, whatever the chain declares"
@@ -3554,4 +3660,359 @@ fn a_nil_entry_clears_the_slot_on_the_wire_path_too() {
     );
     assert_eq!(acc.textures.len(), 1);
     assert_eq!(acc.textures[0].index, 0);
+}
+
+/// A texture view names a slice of its base, and compute stages that slice.
+///
+/// The view resolver used to hand compute a base ref, a level and a format and
+/// drop the view's slice range, so a 2D view of slice k of an array texture
+/// staged — and wrote back — slice 0, silently. Each slice here is filled with
+/// a marker that names it, so the wrong slice is a wrong marker rather than
+/// plausible texels.
+///
+/// A view spanning more than one slice needs an arrayed image this rail does
+/// not build yet; it is refused by name rather than narrowed to its first slice.
+#[test]
+fn a_texture_view_of_one_slice_stages_that_slice_and_a_range_is_refused() {
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VIEW,
+        TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_MIPMAP_LEVEL_COUNT,
+        TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_USED_SIZE,
+        TEXTURE_DESC_WIDTH, TEXTURE_VIEW_DESC_BASE_REF, TEXTURE_VIEW_DESC_LEN,
+        TEXTURE_VIEW_DESC_LEVEL_BASE, TEXTURE_VIEW_DESC_LEVEL_COUNT, TEXTURE_VIEW_DESC_OPCODE,
+        TEXTURE_VIEW_DESC_PIXEL_FORMAT, TEXTURE_VIEW_DESC_SLICE_BASE,
+        TEXTURE_VIEW_DESC_SLICE_COUNT, TEXTURE_VIEW_DESC_TEXTURE_REF,
+        TEXTURE_VIEW_DESC_TEXTURE_TYPE, TEXTURE_VIEW_MIN_RANGED, TEXTURE_VIEW_MTL_TYPE_2D,
+        TEXTURE_VIEW_OPCODE_RANGED,
+    };
+
+    const SIDE: u32 = 4;
+    const BPP: u32 = 4;
+    const SLICES: u64 = 3;
+    const BASE_REF: u32 = 11;
+    let stride = u64::from(SIDE * BPP + 16);
+    let slice_bytes = stride * u64::from(SIDE);
+    let marker = |slice: u64| (0x20 + slice * 0x11) as u8;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
+
+    let handle = 5u64;
+    let base_gva = handle << RESOURCE_PAGE_SHIFT;
+    let mut image = Vec::new();
+    for slice in 0..SLICES {
+        image.extend(vec![marker(slice); slice_bytes as usize]);
+    }
+    write_task_gva_arm64e(&mut host, &state.tasks[1], base_gva, &image);
+
+    let mut desc = vec![0u8; TEXTURE_DESC_BASE_LEN];
+    st64(&mut desc[LINEAR_DESC_SIZE..], SLICES * slice_bytes);
+    st64(&mut desc[LINEAR_DESC_HANDLE..], handle);
+    desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT] = 1;
+    st32(&mut desc[TEXTURE_DESC_USED_SIZE..], slice_bytes as u32);
+    st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], stride as u32);
+    st32(&mut desc[TEXTURE_DESC_WIDTH..], SIDE);
+    st32(&mut desc[TEXTURE_DESC_HEIGHT..], SIDE);
+    st16(
+        &mut desc[TEXTURE_DESC_PIXEL_FORMAT..],
+        MTL_FORMAT_BGRA8_UNORM,
+    );
+    let list_entry =
+        |host: &mut FakeHost, state: &DeviceState, r: u32, ot: u8, len: usize, at: u64| {
+            let off = list_object_entry_offset(r, 32).unwrap();
+            let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+            st32(&mut le[0..], (ot as u32) | ((len as u32) << 8));
+            le[4..12].copy_from_slice(&at.to_le_bytes());
+            write_task_gva_arm64e(host, &state.tasks[1], off, &le);
+        };
+    write_task_gva_arm64e(&mut host, &state.tasks[1], 0x2000, &desc);
+    list_entry(
+        &mut host,
+        &state,
+        BASE_REF,
+        OBJECT_TYPE_TEXTURE,
+        desc.len(),
+        0x2000,
+    );
+
+    // A ranged 2D view of `[slice_base, slice_base + slice_count)` of the base.
+    let install_view = |host: &mut FakeHost, state: &DeviceState, r: u32, base: u64, count: u64| {
+        let len = TEXTURE_VIEW_MIN_RANGED;
+        let mut v = vec![0u8; len];
+        st32(
+            &mut v[TEXTURE_VIEW_DESC_OPCODE..],
+            TEXTURE_VIEW_OPCODE_RANGED,
+        );
+        st32(&mut v[TEXTURE_VIEW_DESC_LEN..], len as u32);
+        st32(&mut v[TEXTURE_VIEW_DESC_TEXTURE_REF..], r);
+        st32(&mut v[TEXTURE_VIEW_DESC_BASE_REF..], BASE_REF);
+        st16(
+            &mut v[TEXTURE_VIEW_DESC_PIXEL_FORMAT..],
+            MTL_FORMAT_BGRA8_UNORM,
+        );
+        st16(
+            &mut v[TEXTURE_VIEW_DESC_TEXTURE_TYPE..],
+            TEXTURE_VIEW_MTL_TYPE_2D,
+        );
+        st64(&mut v[TEXTURE_VIEW_DESC_LEVEL_BASE..], 0);
+        st64(&mut v[TEXTURE_VIEW_DESC_LEVEL_COUNT..], 1);
+        st64(&mut v[TEXTURE_VIEW_DESC_SLICE_BASE..], base);
+        st64(&mut v[TEXTURE_VIEW_DESC_SLICE_COUNT..], count);
+        let at = 0x3000 + u64::from(r) * 0x80;
+        write_task_gva_arm64e(host, &state.tasks[1], at, &v);
+        list_entry(host, state, r, OBJECT_TYPE_TEXTURE_VIEW, len, at);
+    };
+    install_view(&mut host, &state, 12, 2, 1);
+    install_view(&mut host, &state, 13, 1, 2);
+
+    let sampled = stage_texture_raw::<NeutralStage, _>(
+        &mut state,
+        &mut host,
+        1,
+        12,
+        0,
+        false,
+        crate::runtime::compute_exec::ComputeTextureShape::Plain2d,
+    )
+    .expect("a view of one slice is a single 2D image");
+    assert_eq!((sampled.width, sampled.height), (SIDE, SIDE));
+    assert!(
+        sampled.bytes.iter().all(|b| *b == marker(2)),
+        "the view names slice 2; staged {:#04x}.. (slice 0 is {:#04x})",
+        sampled.bytes[0],
+        marker(0)
+    );
+
+    let written = stage_texture_raw::<NeutralStage, _>(
+        &mut state,
+        &mut host,
+        1,
+        12,
+        0,
+        true,
+        crate::runtime::compute_exec::ComputeTextureShape::Plain2d,
+    )
+    .expect("the same view stages as a storage destination");
+    assert!(written.bytes.iter().all(|b| *b == marker(2)));
+    match &written.writeback {
+        TextureWriteback::Linear { gva, .. } => assert_eq!(
+            *gva,
+            base_gva + 2 * slice_bytes,
+            "a write through the view lands in slice 2, not slice 0"
+        ),
+        _ => panic!("a linear view writes back linearly"),
+    }
+
+    let range = stage_texture_raw::<NeutralStage, _>(
+        &mut state,
+        &mut host,
+        1,
+        13,
+        0,
+        false,
+        crate::runtime::compute_exec::ComputeTextureShape::Plain2d,
+    );
+    assert_eq!(
+        range.err(),
+        Some(ComputeStatus::Unsupported("compute_view_slice_range")),
+        "two slices need an arrayed image; narrowing to one would read the wrong texels"
+    );
+}
+
+/// A cube is staged as its six faces, face after face, from a linear texture's
+/// contiguous slices — and written back to the same six.
+///
+/// Each face is filled with a marker that names it and its rows are padded, so
+/// a face read from the wrong slice, or at the wrong pitch, is a wrong marker or
+/// padding rather than plausible texels. The faces are one run of rows over
+/// guest memory, which is why the writeback is one `w × 6h` window.
+///
+/// Refused by name, each: faces that are not square, a declared mip chain
+/// (whose face layout above level 0 is unmeasured), and a view that exposes
+/// anything but six faces.
+#[test]
+fn a_cube_stages_its_six_faces_in_order_and_writes_them_back_in_place() {
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VIEW,
+        TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_LEVEL_RECORDS,
+        TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_MIP_LEVEL_RECORD_LEN,
+        TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_USED_SIZE,
+        TEXTURE_DESC_WIDTH, TEXTURE_LEVEL_HEIGHT, TEXTURE_LEVEL_OFFSET, TEXTURE_LEVEL_ROW_STRIDE,
+        TEXTURE_LEVEL_SIZE, TEXTURE_LEVEL_WIDTH, TEXTURE_VIEW_DESC_BASE_REF, TEXTURE_VIEW_DESC_LEN,
+        TEXTURE_VIEW_DESC_LEVEL_BASE, TEXTURE_VIEW_DESC_LEVEL_COUNT, TEXTURE_VIEW_DESC_OPCODE,
+        TEXTURE_VIEW_DESC_PIXEL_FORMAT, TEXTURE_VIEW_DESC_SLICE_BASE,
+        TEXTURE_VIEW_DESC_SLICE_COUNT, TEXTURE_VIEW_DESC_TEXTURE_REF,
+        TEXTURE_VIEW_DESC_TEXTURE_TYPE, TEXTURE_VIEW_MIN_RANGED, TEXTURE_VIEW_MTL_TYPE_2D,
+        TEXTURE_VIEW_OPCODE_RANGED,
+    };
+    use ComputeTextureShape::Cube;
+
+    const SIDE: u32 = 4;
+    const BPP: u32 = 4;
+    const FACES: u64 = 6;
+    const PAD: u8 = 0xEE;
+    let stride = u64::from(SIDE * BPP + 16);
+    let face_bytes = stride * u64::from(SIDE);
+    let marker = |face: u64| (0x30 + face * 0x11) as u8;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
+
+    let list_entry =
+        |host: &mut FakeHost, state: &DeviceState, r: u32, ot: u8, len: usize, at: u64| {
+            let off = list_object_entry_offset(r, 32).unwrap();
+            let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+            st32(&mut le[0..], (ot as u32) | ((len as u32) << 8));
+            le[4..12].copy_from_slice(&at.to_le_bytes());
+            write_task_gva_arm64e(host, &state.tasks[1], off, &le);
+        };
+    // A linear texture of `width × height` with `levels` declared, its six
+    // faces padded and marked, at `handle`'s pages.
+    let install_cube =
+        |host: &mut FakeHost, state: &DeviceState, r: u32, handle: u64, width: u32, levels: u32| {
+            let mut image = Vec::new();
+            for face in 0..FACES {
+                for _ in 0..SIDE {
+                    image.extend(vec![marker(face); (width * BPP) as usize]);
+                    image.extend(vec![PAD; (stride - u64::from(width * BPP)) as usize]);
+                }
+            }
+            let base = handle << RESOURCE_PAGE_SHIFT;
+            write_task_gva_arm64e(host, &state.tasks[1], base, &image);
+            let len =
+                TEXTURE_DESC_BASE_LEN + (levels as usize - 1) * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+            let mut desc = vec![0u8; len];
+            st64(&mut desc[LINEAR_DESC_SIZE..], image.len() as u64);
+            st64(&mut desc[LINEAR_DESC_HANDLE..], handle);
+            desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT] = levels as u8;
+            st32(&mut desc[TEXTURE_DESC_USED_SIZE..], face_bytes as u32);
+            st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], stride as u32);
+            st32(&mut desc[TEXTURE_DESC_WIDTH..], width);
+            st32(&mut desc[TEXTURE_DESC_HEIGHT..], SIDE);
+            for level in 1..levels {
+                // A level record past the faces; its bytes are never read here.
+                let rec = TEXTURE_DESC_LEVEL_RECORDS
+                    + (level as usize - 1) * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+                st64(&mut desc[rec + TEXTURE_LEVEL_OFFSET..], FACES * face_bytes);
+                st64(&mut desc[rec + TEXTURE_LEVEL_SIZE..], stride);
+                st64(&mut desc[rec + TEXTURE_LEVEL_ROW_STRIDE..], stride);
+                st32(&mut desc[rec + TEXTURE_LEVEL_WIDTH..], 1);
+                st32(&mut desc[rec + TEXTURE_LEVEL_HEIGHT..], 1);
+            }
+            let pf = TEXTURE_DESC_PIXEL_FORMAT
+                + (levels as usize - 1) * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+            st16(&mut desc[pf..], MTL_FORMAT_BGRA8_UNORM);
+            let at = 0x2000 + u64::from(r) * 0x200;
+            write_task_gva_arm64e(host, &state.tasks[1], at, &desc);
+            list_entry(host, state, r, OBJECT_TYPE_TEXTURE, desc.len(), at);
+        };
+    let install_view =
+        |host: &mut FakeHost, state: &DeviceState, r: u32, base_ref: u32, count: u64| {
+            let len = TEXTURE_VIEW_MIN_RANGED;
+            let mut v = vec![0u8; len];
+            st32(
+                &mut v[TEXTURE_VIEW_DESC_OPCODE..],
+                TEXTURE_VIEW_OPCODE_RANGED,
+            );
+            st32(&mut v[TEXTURE_VIEW_DESC_LEN..], len as u32);
+            st32(&mut v[TEXTURE_VIEW_DESC_TEXTURE_REF..], r);
+            st32(&mut v[TEXTURE_VIEW_DESC_BASE_REF..], base_ref);
+            st16(
+                &mut v[TEXTURE_VIEW_DESC_PIXEL_FORMAT..],
+                MTL_FORMAT_BGRA8_UNORM,
+            );
+            st16(
+                &mut v[TEXTURE_VIEW_DESC_TEXTURE_TYPE..],
+                TEXTURE_VIEW_MTL_TYPE_2D,
+            );
+            st64(&mut v[TEXTURE_VIEW_DESC_LEVEL_BASE..], 0);
+            st64(&mut v[TEXTURE_VIEW_DESC_LEVEL_COUNT..], 1);
+            st64(&mut v[TEXTURE_VIEW_DESC_SLICE_BASE..], 0);
+            st64(&mut v[TEXTURE_VIEW_DESC_SLICE_COUNT..], count);
+            let at = 0x6000 + u64::from(r) * 0x80;
+            write_task_gva_arm64e(host, &state.tasks[1], at, &v);
+            list_entry(host, state, r, OBJECT_TYPE_TEXTURE_VIEW, len, at);
+        };
+    install_cube(&mut host, &state, 11, 5, SIDE, 1);
+
+    let check_faces = |bytes: &[u8]| {
+        assert_eq!(bytes.len(), (FACES * u64::from(SIDE * SIDE * BPP)) as usize);
+        assert!(
+            !bytes.contains(&PAD),
+            "row padding must not reach the image"
+        );
+        for (face, texels) in bytes.chunks_exact((SIDE * SIDE * BPP) as usize).enumerate() {
+            assert!(
+                texels.iter().all(|b| *b == marker(face as u64)),
+                "face {face} holds {:#04x}.., its marker is {:#04x}",
+                texels[0],
+                marker(face as u64)
+            );
+        }
+    };
+
+    let sampled =
+        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, 11, 0, false, Cube)
+            .expect("a linear cube stages as six faces");
+    assert_eq!(sampled.shape, Cube);
+    assert_eq!(
+        (sampled.width, sampled.height, sampled.mip_levels),
+        (SIDE, SIDE, 1),
+        "width and height are one face's"
+    );
+    check_faces(&sampled.bytes);
+
+    let written = stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, 11, 0, true, Cube)
+        .expect("the same cube stages as a storage destination");
+    check_faces(&written.bytes);
+    match &written.writeback {
+        TextureWriteback::Linear {
+            gva,
+            height,
+            row_stride,
+            ..
+        } => {
+            assert_eq!(*gva, 5 << RESOURCE_PAGE_SHIFT);
+            assert_eq!(*row_stride, stride);
+            assert_eq!(
+                *height,
+                SIDE * FACES as u32,
+                "all six faces, one run of rows"
+            );
+        }
+        _ => panic!("a linear cube writes back linearly"),
+    }
+
+    // A cube view of all six faces is the cube; a view of one face is not.
+    install_view(&mut host, &state, 12, 11, 6);
+    install_view(&mut host, &state, 13, 11, 1);
+    let through_view =
+        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, 12, 0, false, Cube)
+            .expect("a view of the six faces stages the cube");
+    check_faces(&through_view.bytes);
+    assert_eq!(
+        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, 13, 0, false, Cube).err(),
+        Some(ComputeStatus::Unsupported("compute_view_slice_range"))
+    );
+
+    // Not square.
+    install_cube(&mut host, &state, 14, 6, SIDE / 2, 1);
+    assert_eq!(
+        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, 14, 0, false, Cube).err(),
+        Some(ComputeStatus::Unsupported("compute_cube_not_square"))
+    );
+    // A declared chain.
+    install_cube(&mut host, &state, 15, 7, SIDE, 2);
+    assert_eq!(
+        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, 15, 0, false, Cube).err(),
+        Some(ComputeStatus::Unsupported("compute_cube_mip_chain"))
+    );
 }

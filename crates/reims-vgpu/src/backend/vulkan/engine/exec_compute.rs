@@ -14,9 +14,9 @@ use super::counters::EngineCounters;
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::pools::{BufferSlot, ResourcePools, StorageImageKey, StorageImageSlot};
 use super::types::{
-    ComputeBufferOutput, ComputeDispatch, ComputeDispatchPayload, ComputeOutput, ComputeRequest,
-    ComputeResidentSampleBind, ComputeSampledImageResource, ComputeSampledSource,
-    ComputeStorageResidency, DrawError, TargetIdentity,
+    ComputeBufferOutput, ComputeDispatch, ComputeDispatchPayload, ComputeImageDestination,
+    ComputeOutput, ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource,
+    ComputeSampledSource, ComputeStorageResidency, ComputeTextureShape, DrawError, TargetIdentity,
 };
 use super::vk_call::{VkCall, VkOp};
 
@@ -203,6 +203,30 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
                 },
             ));
         }
+        if img.shape == ComputeTextureShape::Cube {
+            validate_cube_face(img.binding, img.width, img.height)?;
+            if img.mip_levels != 1 {
+                return Err(DrawError::ComputeValidation(
+                    ComputeValidationDecline::CubeLevels {
+                        binding: img.binding,
+                        mip_levels: img.mip_levels,
+                    },
+                ));
+            }
+            let source = match &img.source {
+                ComputeSampledSource::Bytes(_) => None,
+                ComputeSampledSource::ResidentCopy(_) => Some("resident_copy"),
+                ComputeSampledSource::MultisampleTarget(_) => Some("multisample_target"),
+            };
+            if let Some(source) = source {
+                return Err(DrawError::ComputeValidation(
+                    ComputeValidationDecline::CubeSource {
+                        binding: img.binding,
+                        source,
+                    },
+                ));
+            }
+        }
         // Only the source that actually carries bytes owes a length. The other
         // two derive theirs from this same geometry, so there is nothing left
         // for them to disagree with.
@@ -217,6 +241,7 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
                 img.mip_levels,
                 img.format.bytes_per_texel(),
             )
+            .and_then(|level_bytes| level_bytes.checked_mul(img.shape.layers() as usize))
             .unwrap_or(usize::MAX);
             if bytes.len() != expected {
                 return Err(DrawError::ComputeValidation(
@@ -275,9 +300,30 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
                 },
             ));
         }
+        if img.shape == ComputeTextureShape::Cube {
+            validate_cube_face(img.binding, img.width, img.height)?;
+            // Both are one 2D window: the resident registry keeps one image per
+            // identity and a guest copy plan describes one rectangle.
+            let source = if img.residency.is_some() {
+                Some("residency")
+            } else if !matches!(img.destination, ComputeImageDestination::Host) {
+                Some("guest_pages")
+            } else {
+                None
+            };
+            if let Some(source) = source {
+                return Err(DrawError::ComputeValidation(
+                    ComputeValidationDecline::CubeSource {
+                        binding: img.binding,
+                        source,
+                    },
+                ));
+            }
+        }
         let expected = (img.width as usize)
             .saturating_mul(img.height as usize)
-            .saturating_mul(img.format.bytes_per_texel());
+            .saturating_mul(img.format.bytes_per_texel())
+            .saturating_mul(img.shape.layers() as usize);
         if img.bytes.len() != expected {
             return Err(DrawError::ComputeValidation(
                 ComputeValidationDecline::StorageBytesLength {
@@ -289,6 +335,21 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
         }
     }
     Ok(())
+}
+
+/// A cube's faces are square: a cube image of any other extent is invalid
+/// usage, so the request is refused by name before any image is built.
+fn validate_cube_face(binding: u32, width: u32, height: u32) -> Result<(), DrawError> {
+    if width == height {
+        return Ok(());
+    }
+    Err(DrawError::ComputeValidation(
+        ComputeValidationDecline::CubeNotSquare {
+            binding,
+            width,
+            height,
+        },
+    ))
 }
 
 /// A copy-on-sample bind must name a resident whose image is byte-for-byte the
@@ -636,6 +697,7 @@ pub(crate) unsafe fn execute_compute_inner(
         let key = StorageImageKey {
             width: resource.width,
             height: resource.height,
+            shape: resource.shape,
             format: resource.format,
             sampled_only: true,
             mip_levels: resource.mip_levels.max(1),
@@ -650,6 +712,7 @@ pub(crate) unsafe fn execute_compute_inner(
             resource.mip_levels.max(1),
             resource.format.bytes_per_texel(),
         )
+        .and_then(|level_bytes| level_bytes.checked_mul(resource.shape.layers() as usize))
         .unwrap_or(0) as u64;
         let resident_copy = match &resource.source {
             ComputeSampledSource::ResidentCopy(bind) => Some(*bind),
@@ -732,6 +795,7 @@ pub(crate) unsafe fn execute_compute_inner(
         let key = StorageImageKey {
             width: resource.width,
             height: resource.height,
+            shape: resource.shape,
             format: resource.format,
             sampled_only: false,
             // A compute write names one level, so a storage image is one level.
@@ -930,9 +994,9 @@ pub(crate) unsafe fn execute_compute_inner(
             continue;
         };
         let (binding, width, height, mip_levels) = (*binding, *width, *height, *mip_levels);
-        // Every level of the pyramid, not just the base: a level left in
-        // `UNDEFINED` reads as a level nothing ever wrote.
-        let range = super::color_subresource_range_levels(mip_levels);
+        // Every level of the pyramid and every layer, not just the base: a
+        // level or a face left in `UNDEFINED` reads as one nothing ever wrote.
+        let range = img.key.subresource_range();
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::empty())
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -952,7 +1016,10 @@ pub(crate) unsafe fn execute_compute_inner(
         if let Some(st) = upload {
             // One region per level, at the offset the *producer* packed it at.
             // Both ends read `tight_pyramid_spans`, so neither computes a
-            // layout of its own and the two cannot drift.
+            // layout of its own and the two cannot drift. Each region names
+            // every layer, which reads them face after face from one run; a
+            // layered image is one level (a cube with a chain is refused
+            // above), so no level's span has to make room for its faces.
             let Some(spans) = reims_vgpu_protocol::extent::tight_pyramid_spans(
                 width,
                 height,
@@ -973,7 +1040,7 @@ pub(crate) unsafe fn execute_compute_inner(
                 .map(|span| {
                     vk::BufferImageCopy::default()
                         .buffer_offset(span.offset as u64)
-                        .image_subresource(super::color_subresource_layers().mip_level(span.level))
+                        .image_subresource(img.key.subresource_layers(span.level))
                         .image_extent(vk::Extent3D {
                             width: span.width,
                             height: span.height,
@@ -1071,7 +1138,7 @@ pub(crate) unsafe fn execute_compute_inner(
     // image directly from the prior readback layout into GENERAL.
     for prepared in &simg_slots {
         let img = &prepared.slot;
-        let range = super::color_subresource_range();
+        let range = img.key.subresource_range();
         let (src_stage, src_access) = prepared.initial_access.source_scope();
         if let Some(st) = &prepared.seed {
             let barrier = [vk::ImageMemoryBarrier::default()
@@ -1091,7 +1158,7 @@ pub(crate) unsafe fn execute_compute_inner(
                 &barrier,
             );
             let copy = [vk::BufferImageCopy::default()
-                .image_subresource(super::color_subresource_layers())
+                .image_subresource(img.key.subresource_layers(0))
                 .image_extent(vk::Extent3D {
                     width: prepared.width,
                     height: prepared.height,
@@ -1126,7 +1193,7 @@ pub(crate) unsafe fn execute_compute_inner(
             .old_layout(old_layout)
             .new_layout(vk::ImageLayout::GENERAL)
             .image(img.image)
-            .subresource_range(super::color_subresource_range())];
+            .subresource_range(img.key.subresource_range())];
         ctx.device.cmd_pipeline_barrier(
             cb,
             old_stage,
@@ -1293,7 +1360,7 @@ pub(crate) unsafe fn execute_compute_inner(
             .old_layout(vk::ImageLayout::GENERAL)
             .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
             .image(img.image)
-            .subresource_range(super::color_subresource_range())];
+            .subresource_range(img.key.subresource_range())];
         ctx.device.cmd_pipeline_barrier(
             cb,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1311,7 +1378,7 @@ pub(crate) unsafe fn execute_compute_inner(
                 let copy = [vk::BufferImageCopy::default()
                     .buffer_offset(0)
                     .buffer_row_length(0)
-                    .image_subresource(super::color_subresource_layers())
+                    .image_subresource(img.key.subresource_layers(0))
                     .image_extent(vk::Extent3D {
                         width: prepared.width,
                         height: prepared.height,
@@ -1601,6 +1668,7 @@ mod tests {
             format: StorageImageFormat::Rgba8Unorm,
             width: 1,
             height: 1,
+            shape: ComputeTextureShape::Plain2d,
             source: ComputeSampledSource::ResidentCopy(ComputeResidentSampleBind {
                 identity: residency_identity(),
                 generation: 9,
@@ -1621,6 +1689,7 @@ mod tests {
             mip_levels: 1,
             width: 1,
             height: 1,
+            shape: ComputeTextureShape::Plain2d,
             format: StorageImageFormat::Rgba8Unorm,
             sampled_only: false,
         }
@@ -1733,6 +1802,7 @@ mod tests {
                 format: StorageImageFormat::Rgba8Unorm,
                 width: 1,
                 height: 1,
+                shape: ComputeTextureShape::Plain2d,
                 source: ComputeSampledSource::Bytes(vec![0; 4]),
             }],
             samplers: vec![SamplerResource::normalized_default(64)],
@@ -1744,6 +1814,7 @@ mod tests {
                 format: StorageImageFormat::Rgba8Uint,
                 width: 1,
                 height: 1,
+                shape: ComputeTextureShape::Plain2d,
                 bytes: vec![0; 4],
                 residency: None,
                 seed_skipped: false,

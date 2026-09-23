@@ -2980,6 +2980,9 @@ pub enum ReflectedComputeTexture {
     /// stage: a binding comes from one mapper-ref-texture plane window or one linear GVA
     /// level, both flat `width × height` rectangles.
     Plain2d(ImageAccess),
+    /// One cube — six square faces, staged face after face from a linear
+    /// texture's contiguous slices — carrying its sampled-vs-storage class.
+    Cube(ImageAccess),
     /// A single-layer multisampled 2D texture the kernel reads
     /// (`texture2d_ms<T, access::read>`).
     ///
@@ -3004,8 +3007,9 @@ pub enum ReflectedComputeTexture {
 /// `Unknown`. The shape axis comes from the same decoded `OpTypeImage`, and
 /// the rail refuses anything it would otherwise stage as 2D behind the
 /// shader's back: binding a `TYPE_2D` view to a SPIR-V image declared
-/// `2DArray`/`3D`/`1D`/`Cube`/`Buffer` is a descriptor-type mismatch, not a
-/// degraded render. A multisampled read binding is the one shape that is
+/// `2DArray`/`3D`/`1D`/cube-array/`Buffer` is a descriptor-type mismatch, not
+/// a degraded render. A single cube is staged as one (see
+/// [`ReflectedComputeTexture::Cube`]). A multisampled read binding is the one shape that is
 /// neither staged nor refused: see [`ReflectedComputeTexture::Multisample2d`].
 pub fn reflected_compute_texture(
     reflection: &ShaderReflection,
@@ -3017,7 +3021,8 @@ pub fn reflected_compute_texture(
     let axis = match shape.dimension {
         TextureDimension::D1 => Some("dim_1d"),
         TextureDimension::D3 => Some("dim_3d"),
-        TextureDimension::Cube => Some("dim_cube"),
+        TextureDimension::Cube if shape.arrayed => Some("cube_arrayed"),
+        TextureDimension::Cube => None,
         TextureDimension::Buffer => Some("dim_buffer"),
         // Ahead of the sample axis on purpose: the resident that serves a
         // multisample bind is one layer, so an arrayed multisample texture is
@@ -3035,14 +3040,18 @@ pub fn reflected_compute_texture(
     if let Some(axis) = axis {
         return ReflectedComputeTexture::UnstageableShape { axis };
     }
-    if shape.multisampled {
-        return ReflectedComputeTexture::Multisample2d;
-    }
-    ReflectedComputeTexture::Plain2d(if shape.writable {
+    let access = if shape.writable {
         ImageAccess::Storage
     } else {
         ImageAccess::Sampled
-    })
+    };
+    if shape.dimension == TextureDimension::Cube {
+        return ReflectedComputeTexture::Cube(access);
+    }
+    if shape.multisampled {
+        return ReflectedComputeTexture::Multisample2d;
+    }
+    ReflectedComputeTexture::Plain2d(access)
 }
 
 /// Validate that the translator's reflection is internally well-formed, once per
@@ -4591,8 +4600,9 @@ mod more_tests {
             (TextureDimension::D1, false, false, "dim_1d"),
             (TextureDimension::D1, true, false, "dim_1d"),
             (TextureDimension::D3, false, false, "dim_3d"),
-            (TextureDimension::Cube, false, false, "dim_cube"),
-            (TextureDimension::Cube, true, false, "dim_cube"),
+            // A cube array is six faces per slice, and the rail stages one
+            // cube: its slice axis is what refuses it.
+            (TextureDimension::Cube, true, false, "cube_arrayed"),
             (TextureDimension::Buffer, false, false, "dim_buffer"),
             (TextureDimension::D2, true, false, "arrayed"),
             // Multisampled *and* arrayed: `texture2d_ms_array`. The slice axis
@@ -4615,7 +4625,7 @@ mod more_tests {
             }
         }
 
-        // The one stageable shape, both access classes, is not swept up by it.
+        // The stageable shapes, both access classes, are not swept up by it.
         for (writable, want) in [(false, ImageAccess::Sampled), (true, ImageAccess::Storage)] {
             let mut r = empty_reflection(ShaderStage::Kernel);
             r.bindings.push(texture_binding(
@@ -4625,6 +4635,16 @@ mod more_tests {
             assert_eq!(
                 reflected_compute_texture(&r, bind),
                 ReflectedComputeTexture::Plain2d(want)
+            );
+            let mut r = empty_reflection(ShaderStage::Kernel);
+            r.bindings.push(texture_binding(
+                bind,
+                shape(TextureDimension::Cube, false, writable),
+            ));
+            assert_eq!(
+                reflected_compute_texture(&r, bind),
+                ReflectedComputeTexture::Cube(want),
+                "a single cube is six staged faces, sampled or written"
             );
         }
     }

@@ -75,6 +75,24 @@ pub enum ComputeValidationDecline {
         actual: usize,
         expected: usize,
     },
+    /// A cube whose faces are not square, which no cube image can hold.
+    CubeNotSquare {
+        binding: u32,
+        width: u32,
+        height: u32,
+    },
+    /// A cube carrying a mip chain, whose face layout above level 0 is
+    /// unmeasured.
+    CubeLevels {
+        binding: u32,
+        mip_levels: u32,
+    },
+    /// A cube asking for a source or destination that is one 2D image: a
+    /// resident, a multisample target, or a guest-page copy plan of one window.
+    CubeSource {
+        binding: u32,
+        source: &'static str,
+    },
 }
 
 impl Decline for ComputeValidationDecline {
@@ -108,6 +126,9 @@ impl Decline for ComputeValidationDecline {
             }
             Self::StorageZeroGeometry { .. } => "vk_compute_validate_storage_zero_geometry",
             Self::StorageBytesLength { .. } => "vk_compute_validate_storage_bytes_length",
+            Self::CubeNotSquare { .. } => "vk_compute_validate_cube_not_square",
+            Self::CubeLevels { .. } => "vk_compute_validate_cube_levels",
+            Self::CubeSource { .. } => "vk_compute_validate_cube_source",
         }
     }
 
@@ -145,6 +166,11 @@ impl Decline for ComputeValidationDecline {
                 height,
             }
             | Self::StorageZeroGeometry {
+                binding,
+                width,
+                height,
+            }
+            | Self::CubeNotSquare {
                 binding,
                 width,
                 height,
@@ -190,6 +216,17 @@ impl Decline for ComputeValidationDecline {
                     "group_count",
                     format!("{}x{}x{}", group_count[0], group_count[1], group_count[2]),
                 ),
+            ],
+            Self::CubeLevels {
+                binding,
+                mip_levels,
+            } => vec![
+                ("binding", binding.to_string()),
+                ("mip_levels", mip_levels.to_string()),
+            ],
+            Self::CubeSource { binding, source } => vec![
+                ("binding", binding.to_string()),
+                ("source", (*source).to_string()),
             ],
             Self::EmptySpirv
             | Self::EmptyEntry
@@ -257,6 +294,19 @@ mod tests {
                 actual: 3,
                 expected: 4,
             },
+            ComputeValidationDecline::CubeNotSquare {
+                binding: 32,
+                width: 4,
+                height: 2,
+            },
+            ComputeValidationDecline::CubeLevels {
+                binding: 32,
+                mip_levels: 3,
+            },
+            ComputeValidationDecline::CubeSource {
+                binding: 34,
+                source: "residency",
+            },
         ]
     }
 
@@ -280,7 +330,9 @@ mod tests {
         // for a request to get wrong.
         // Up from 16: an exact-thread launch is decomposed into regions, and
         // both ways that decomposition can carry no work are their own reason.
-        assert_eq!(before, 18, "the compute validator's reason census moved");
+        // Up from 18: a cube is the one layered shape, and its square faces,
+        // single level and bytes-only source are each their own reason.
+        assert_eq!(before, 21, "the compute validator's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate compute-validation slug");
     }
 

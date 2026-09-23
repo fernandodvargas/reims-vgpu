@@ -3912,3 +3912,120 @@ fn an_absurd_level_count_refuses_as_a_bad_count_not_as_a_short_body() {
         .iter()
         .any(|l| l.starts_with("dual_plane_levels_over_cap")));
 }
+
+/// One array slice of a linear texture, located the way blit measured it.
+///
+/// Slices of level 0 sit `slice_stride` apart past the level's base — the
+/// packing buffer→texture blit (opcode 0x12c) reads at slices 1 and 2 on a live
+/// x86 boot. Above level 0 nobody has measured whether slices nest inside a
+/// level or levels inside a slice, so a non-zero slice there is refused rather
+/// than placed by a guess, and so is one the allocation cannot hold whole.
+#[test]
+fn a_linear_slice_is_located_past_its_level_and_inside_its_allocation() {
+    const STRIDE: u64 = 64;
+    const SIDE: u32 = 4;
+    const TIGHT: u32 = SIDE * 4;
+    let slice = STRIDE * u64::from(SIDE);
+    let level0 = TextureLevelLayout {
+        offset: 0,
+        size: slice,
+        row_stride: STRIDE,
+        width: SIDE,
+        height: SIDE,
+        depth: 1,
+    };
+    let level1 = TextureLevelLayout {
+        offset: 3 * slice,
+        size: STRIDE * 2,
+        row_stride: STRIDE,
+        width: 2,
+        height: 2,
+        depth: 1,
+    };
+    let tex = TextureDescriptor {
+        allocation_size: 3 * slice + STRIDE * 2,
+        handle: 5,
+        levels: vec![level0, level1],
+        ..TextureDescriptor::default()
+    };
+    let base = tex.allocation_base_gva(PAGE_SHIFT_ARM64E).unwrap();
+
+    // Slice 0 is the level itself.
+    let (gva0, _) = tex
+        .level_slice_gva(0, 0, PAGE_SHIFT_ARM64E, SIDE, TIGHT)
+        .unwrap();
+    assert_eq!(gva0, tex.level_gva(0, PAGE_SHIFT_ARM64E).unwrap().0);
+
+    // Slice 2 is two whole slices on, and ends inside the allocation.
+    let (gva2, layout2) = tex
+        .level_slice_gva(0, 2, PAGE_SHIFT_ARM64E, SIDE, TIGHT)
+        .unwrap();
+    assert_eq!(gva2, base + 2 * slice);
+    assert_eq!((layout2.width, layout2.height), (SIDE, SIDE));
+
+    // A slice the allocation cannot hold whole is refused. (Where the array
+    // part of an allocation ends is not knowable — the descriptor's array
+    // length is not decoded — but where the allocation ends is.)
+    let short = TextureDescriptor {
+        allocation_size: 3 * slice,
+        ..tex.clone()
+    };
+    assert_eq!(
+        short
+            .level_slice_gva(0, 3, PAGE_SHIFT_ARM64E, SIDE, TIGHT)
+            .err(),
+        Some(SliceWindowRefusal::PastAllocation)
+    );
+
+    // Above level 0 the packing is unmeasured.
+    assert_eq!(
+        tex.level_slice_gva(1, 1, PAGE_SHIFT_ARM64E, SIDE, TIGHT)
+            .err(),
+        Some(SliceWindowRefusal::UnmeasuredLevel)
+    );
+    // Level 1 slice 0 is still just the level.
+    assert!(tex
+        .level_slice_gva(1, 0, PAGE_SHIFT_ARM64E, SIDE, TIGHT)
+        .is_ok());
+
+    // No declared allocation, no bound to check a non-zero slice against.
+    let unsized_tex = TextureDescriptor {
+        allocation_size: 0,
+        ..tex.clone()
+    };
+    assert_eq!(
+        unsized_tex
+            .level_slice_gva(0, 1, PAGE_SHIFT_ARM64E, SIDE, TIGHT)
+            .err(),
+        Some(SliceWindowRefusal::UndeclaredAllocation)
+    );
+
+    // A guest slice index that overflows the offset arithmetic is refused,
+    // not wrapped.
+    assert_eq!(
+        tex.level_slice_gva(0, u64::MAX, PAGE_SHIFT_ARM64E, SIDE, TIGHT)
+            .err(),
+        Some(SliceWindowRefusal::Overflow)
+    );
+
+    // A block-compressed level steps by its block rows, not its texel rows:
+    // four texel rows are one BC block row, so a texel-row stride would land
+    // slice 1 four images out.
+    let (bc1, _) = tex
+        .level_slice_gva(0, 1, PAGE_SHIFT_ARM64E, SIDE / 4, TIGHT)
+        .unwrap();
+    assert_eq!(bc1, base + STRIDE * u64::from(SIDE / 4));
+
+    // Every refusal names itself distinctly.
+    let slugs: std::collections::HashSet<_> = [
+        SliceWindowRefusal::NoLevel,
+        SliceWindowRefusal::UnmeasuredLevel,
+        SliceWindowRefusal::UndeclaredAllocation,
+        SliceWindowRefusal::PastAllocation,
+        SliceWindowRefusal::Overflow,
+    ]
+    .iter()
+    .map(|r| r.slug())
+    .collect();
+    assert_eq!(slugs.len(), 5);
+}

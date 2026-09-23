@@ -409,4 +409,46 @@ kernel void heap_alias_fill(texture2d<float, access::write> output [[texture(0)]
         output.write(value, gid);
     }
 }
+
+// The centre of each cube face in Metal's face order (+X -X +Y -Y +Z -Z), then
+// the midpoint of the +X/+Z edge. A uniform face reads its own value at its
+// centre under any filter, so lanes 0-5 are about which layer a face landed
+// in; lane 6 is linear-filtered exactly on an edge, so it is about whether the
+// filter reaches across the seam into the neighbouring face.
+constant float3 cube_probe_dirs[7] = {
+    float3( 1,  0,  0), float3(-1,  0,  0),
+    float3( 0,  1,  0), float3( 0, -1,  0),
+    float3( 0,  0,  1), float3( 0,  0, -1),
+    float3( 1,  0,  1),
+};
+
+kernel void sample_cube_faces(texturecube<float, access::sample> tex [[texture(0)]],
+                              device uint *out [[buffer(0)]],
+                              device uint *ran [[buffer(4)]],
+                              uint gid [[thread_position_in_grid]]) {
+    ran[0] = 1u;
+    if (gid >= 7u) { return; }
+    constexpr sampler nearest_s(filter::nearest, address::clamp_to_edge);
+    constexpr sampler linear_s(filter::linear, address::clamp_to_edge);
+    float4 v = gid < 6u ? tex.sample(nearest_s, cube_probe_dirs[gid])
+                        : tex.sample(linear_s, cube_probe_dirs[gid]);
+    uint r = uint(round(v.r * 255.0));
+    uint g = uint(round(v.g * 255.0));
+    uint b = uint(round(v.b * 255.0));
+    uint a = uint(round(v.a * 255.0));
+    out[gid] = (a << 24) | (b << 16) | (g << 8) | r;
+}
+
+// Every texel of every face written with a value that names its x, its y and
+// its face, so a texel landing in the wrong face or the wrong place says where.
+kernel void write_cube_faces(texturecube<float, access::write> tex [[texture(0)]],
+                             constant uint &side [[buffer(1)]],
+                             device uint *ran [[buffer(4)]],
+                             uint3 gid [[thread_position_in_grid]]) {
+    ran[0] = 1u;
+    if (gid.x >= side || gid.y >= side || gid.z >= 6u) { return; }
+    float4 c = float4(float(gid.x * 40u + 10u), float(gid.y * 40u + 10u),
+                      float(gid.z * 40u + 20u), 255.0) / 255.0;
+    tex.write(c, uint2(gid.xy), gid.z);
+}
 """

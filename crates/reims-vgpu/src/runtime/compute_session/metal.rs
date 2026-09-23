@@ -599,8 +599,15 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
             for (st, abm) in stream_tex.iter().zip(ab_layout.textures.iter()) {
                 let is_storage = abm.access != BINDING_ACCESS_READ_ONLY;
                 let binding = REIMS_VGPU_BINDING_TEXTURE_BASE + st.index;
-                let staged =
-                    stage_texture_raw(state, host, task_id, st.texture_ref, binding, is_storage)?;
+                let staged = stage_texture_raw(
+                    state,
+                    host,
+                    task_id,
+                    st.texture_ref,
+                    binding,
+                    is_storage,
+                    crate::runtime::compute_exec::ComputeTextureShape::Plain2d,
+                )?;
                 // Materialize Metal texture (not set_texture on encoder — only AB).
                 let selector = staged.storage_selector_or_refuse(task_id, acc.pipeline_ref)?;
                 let (pixel_format, bpp) = storage_image_format(selector);
@@ -761,6 +768,7 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                         t.texture_ref,
                         binding,
                         is_storage,
+                        crate::runtime::compute_exec::ComputeTextureShape::Plain2d,
                     )?);
                 }
 

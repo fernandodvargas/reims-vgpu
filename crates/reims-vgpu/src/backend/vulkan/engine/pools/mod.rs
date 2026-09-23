@@ -1688,13 +1688,18 @@ struct ResidentSampledSlot {
     last_touch_ms: u64,
 }
 
-/// Geometry+format key for storage-image pool free lists. Compute images are single-layer 2D by
-/// contract (see [`crate::backend::vulkan::engine::ComputeStorageImageResource`]), so geometry is
-/// exactly width × height.
+/// Geometry+format key for storage-image pool free lists. A compute image is one 2D image or one
+/// cube (see [`crate::backend::vulkan::engine::ComputeStorageImageResource`]), so geometry is
+/// width × height × the shape's layers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct StorageImageKey {
+    /// Extent of one layer: for a cube, of one face.
     pub width: u32,
     pub height: u32,
+    /// Part of the key for the reason `mip_levels` is: a one-layer free slot
+    /// handed to a cube request would leave five faces nobody wrote, and a cube
+    /// view cannot be made over an image that lacks `CUBE_COMPATIBLE`.
+    pub shape: crate::runtime::compute_exec::ComputeTextureShape,
     pub format: StorageImageFormat,
     /// Read-only sampled descriptor instead of writable storage descriptor.
     pub sampled_only: bool,
@@ -1706,6 +1711,43 @@ pub(crate) struct StorageImageKey {
     /// request would answer `read(coord, 3)` with nothing at all — which is
     /// indistinguishable from a texture whose upper levels were never written.
     pub mip_levels: u32,
+}
+
+impl StorageImageKey {
+    /// Every level and every layer of an image built for this key.
+    ///
+    /// The one range every barrier on such an image names. A transition that
+    /// names fewer layers than the image has leaves the rest in `UNDEFINED`,
+    /// which for a cube reads as five faces nothing ever wrote.
+    pub(crate) fn subresource_range(&self) -> ash::vk::ImageSubresourceRange {
+        ash::vk::ImageSubresourceRange {
+            layer_count: self.shape.layers(),
+            ..super::color_subresource_range_levels(self.mip_levels)
+        }
+    }
+
+    /// Every layer of one `level`, as a copy region names it. A region naming
+    /// every layer reads or writes them from one tightly packed run, face
+    /// after face, which is the order the staged bytes hold.
+    pub(crate) fn subresource_layers(&self, level: u32) -> ash::vk::ImageSubresourceLayers {
+        super::color_subresource_layers()
+            .mip_level(level)
+            .layer_count(self.shape.layers())
+    }
+
+    /// The view type the shader binds this image through.
+    pub(crate) fn view_type(&self) -> ash::vk::ImageViewType {
+        reims_vgpu_vulkan::view::view_type(self.shape.kind())
+    }
+
+    /// Create flags: a cube view can only be made over an image that says so.
+    pub(crate) fn create_flags(&self) -> ash::vk::ImageCreateFlags {
+        if self.shape.kind().is_cube() {
+            ash::vk::ImageCreateFlags::CUBE_COMPATIBLE
+        } else {
+            ash::vk::ImageCreateFlags::empty()
+        }
+    }
 }
 
 #[derive(Clone, Copy)]

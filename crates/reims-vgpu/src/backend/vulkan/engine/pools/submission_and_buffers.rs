@@ -5643,6 +5643,7 @@ mod recycle_tests {
                 mip_levels: 1,
                 width: w,
                 height: h,
+                shape: crate::runtime::compute_exec::ComputeTextureShape::Plain2d,
                 format: StorageImageFormat::default(),
                 sampled_only: false,
             },
@@ -6067,6 +6068,7 @@ mod recycle_tests {
             mip_levels: 1,
             width: 8,
             height: 8,
+            shape: crate::runtime::compute_exec::ComputeTextureShape::Plain2d,
             format: StorageImageFormat::default(),
             sampled_only: false,
         };
