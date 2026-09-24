@@ -777,18 +777,48 @@ fn air_capture_dir() -> std::path::PathBuf {
     std::path::PathBuf::from("/tmp/reims-vgpu-air")
 }
 
-/// Write one translated AIR blob beside the size of the SPIR-V it produced.
+/// What one translation of an AIR blob produced, as far as [`capture_air`]
+/// names it.
+#[derive(Clone, Copy)]
+enum AirOutcome<'a> {
+    /// The emitted SPIR-V module's bytes.
+    Emitted(&'a [u8]),
+    /// The translator refused the blob; its reason is the decline the caller
+    /// returns, which reaches the fail channel on its own line.
+    Refused,
+}
+
+/// The file name [`capture_air`] gives one blob.
+///
+/// An emitted module leads with its **word count**, because a driver
+/// quarantine line and a validator refusal both quote it. A refused blob has no
+/// module to count, and it is the case a translator handover wants most, so it
+/// is named `refused` instead. The AIR digest disambiguates two shaders whose
+/// modules happen to be the same length, and two refusals of the same stage.
+fn air_capture_name(stage: Stage, outcome: AirOutcome<'_>, digest: u64) -> String {
+    let stage = stage_name(stage);
+    match outcome {
+        AirOutcome::Emitted(spirv) => format!("{stage}-w{}-{digest:016x}.air", spirv.len() / 4),
+        AirOutcome::Refused => format!("{stage}-refused-{digest:016x}.air"),
+    }
+}
+
+/// Write one AIR blob this device translated, named by what the translation
+/// produced.
 ///
 /// The name is the join this exists for. A driver quarantine line and a
-/// validator refusal both quote the emitted module's **word count**, and
-/// neither can name the AIR that produced it — so the count goes in the file
-/// name and a handover is a lookup rather than another boot.
+/// validator refusal both quote the emitted module's word count, and neither
+/// can name the AIR that produced it — so the count goes in the file name and a
+/// handover is a lookup rather than another boot. A blob the translator refused
+/// is written too: its `air_capture refused` line sits beside the decline that
+/// names the reason, and without it the one shader a translator fix needs is
+/// the one shader never captured.
 ///
-/// Observation only, on both the guest path and the failure path: every write
+/// Observation only, on the emitted path and the refused one alike: every write
 /// here is best-effort, and a failure is reported once and then ignored. This
 /// runs after the translation it describes, so it cannot change what that
-/// translation produced or whether it was cached.
-fn capture_air(air: &[u8], stage: Stage, spirv: &[u8]) {
+/// translation produced, whether it was cached, or which decline is returned.
+fn capture_air(air: &[u8], stage: Stage, outcome: AirOutcome<'_>) {
     if !matches!(
         crate::config::switch(crate::config::AIR_CAPTURE),
         crate::config::Switch::On
@@ -803,21 +833,20 @@ fn capture_air(air: &[u8], stage: Stage, spirv: &[u8]) {
         ));
         return;
     }
-    // The AIR digest disambiguates two shaders whose modules happen to be the
-    // same length; the word count is what a quarantine or validator line
-    // quotes, so it leads.
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     air.hash(&mut hasher);
-    let digest = hasher.finish();
-    let words = spirv.len() / 4;
-    let name = format!("{}-w{words}-{digest:016x}.air", stage_name(stage));
+    let name = air_capture_name(stage, outcome, hasher.finish());
     let path = dir.join(&name);
     if path.exists() {
         return;
     }
+    let result = match outcome {
+        AirOutcome::Emitted(spirv) => format!("ok spirv_words={}", spirv.len() / 4),
+        AirOutcome::Refused => "refused".to_owned(),
+    };
     match std::fs::write(&path, air) {
         Ok(()) => crate::observe::fail(format!(
-            "air_capture ok stage={} air_bytes={} spirv_words={words} file={name}",
+            "air_capture {result} stage={} air_bytes={} file={name}",
             stage_name(stage),
             air.len()
         )),
@@ -844,9 +873,13 @@ fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
     // `reflection.datalayout` carries the source `target datalayout` the sanitizer
     // strips, so the post-emit ABI reconciliation below no longer re-reads `k.ll`.
     let (spirv, reflection) =
-        metal2vulkan::translate_reflected(path.to_str().unwrap_or(name), stage, &tmp)
-            .map_err(|e| translate_decline(stage, e.to_string()))?;
-    capture_air(air, stage, &spirv);
+        metal2vulkan::translate_reflected(path.to_str().unwrap_or(name), stage, &tmp).map_err(
+            |e| {
+                capture_air(air, stage, AirOutcome::Refused);
+                translate_decline(stage, e.to_string())
+            },
+        )?;
+    capture_air(air, stage, AirOutcome::Emitted(&spirv));
     finish_translated(spirv, reflection, stage)
 }
 
@@ -867,10 +900,13 @@ fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedSha
         &tmp,
         opts,
     )
-    .map_err(|e| M2vCacheDecline::KernelTranslate {
-        detail: e.to_string(),
+    .map_err(|e| {
+        capture_air(air, Stage::Kernel, AirOutcome::Refused);
+        M2vCacheDecline::KernelTranslate {
+            detail: e.to_string(),
+        }
     })?;
-    capture_air(air, Stage::Kernel, &spirv);
+    capture_air(air, Stage::Kernel, AirOutcome::Emitted(&spirv));
     if reflection.local_size != Some(local_size) {
         return Err(M2vCacheDecline::KernelLocalSizeMismatch {
             requested: local_size,
@@ -1339,6 +1375,26 @@ pub fn reset_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refused blob is named apart from every emitted one, so a capture of
+    /// the shader a translator declined is a file a handover can find rather
+    /// than a zero-word name that collides with nothing and says nothing.
+    #[test]
+    fn air_capture_names_a_refused_blob_apart_from_an_emitted_one() {
+        let spirv = [0u8; 4 * 37];
+        assert_eq!(
+            air_capture_name(Stage::Kernel, AirOutcome::Emitted(&spirv), 0xab),
+            "kernel-w37-00000000000000ab.air"
+        );
+        assert_eq!(
+            air_capture_name(Stage::Kernel, AirOutcome::Refused, 0xab),
+            "kernel-refused-00000000000000ab.air"
+        );
+        assert_eq!(
+            air_capture_name(Stage::Fragment, AirOutcome::Refused, 1),
+            "fragment-refused-0000000000000001.air"
+        );
+    }
 
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

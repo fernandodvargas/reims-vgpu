@@ -243,7 +243,8 @@ pub const SWAPCHAIN_FIFO: &str = "REIMS_VGPU_SWAPCHAIN_FIFO";
 pub const DRAW_LOG: &str = "REIMS_VGPU_DRAW_LOG";
 
 /// Write every AIR blob this device translates to `/tmp/reims-vgpu-air/`,
-/// named by the SPIR-V its translation produced.
+/// named by the SPIR-V its translation produced, or `refused` when the
+/// translator declined it.
 ///
 /// Diagnostic capture for handing a translator defect over. `bugs/` wants the
 /// AIR that reproduces a defect, and the two places a defect shows up — a
