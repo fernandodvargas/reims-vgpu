@@ -49,15 +49,23 @@ host-window = [
     "dep:wayland-backend",
     "dep:wayland-protocols",
     "dep:x11-dl",
+    "host-display",
+    "host-input",
 ]
 # Direct-to-display presentation (M3): the Vulkan rail presents on a DRM
-# connector through VK_KHR_display, with this process as DRM master. No
-# windowing system. Rides on host-window, whose window link the drain already
-# feeds.
-host-display = ["host-window", "dep:libc"]
-# evdev keyboard and mouse with exclusive grab, feeding the same HostAction
-# queue the window uses.
-host-input = ["host-window", "dep:libc"]
+# connector through VK_KHR_display, with this process as DRM master, and no
+# windowing system; evdev keyboard and mouse with exclusive grab feed the same
+# HostAction queue the window uses. Both are Linux-only modules (a Linux build
+# is always the Vulkan rail) and ride on host-window, whose window link the
+# drain already feeds.
+#
+# Folded into host-window rather than opt-in at build time: the staticlib QEMU
+# links is built by the pinned QEMU's meson with exactly
+# `backend-vulkan,host-window`, so a feature the boot has to ask for would never
+# reach the boot. Which output runs is a run-time answer, REIMS_VGPU_OUTPUT
+# (window by default). On macOS both modules compile to nothing.
+host-display = ["dep:libc"]
+host-input = ["dep:libc"]
 
 [dependencies]
 once_cell = "1"

@@ -455,11 +455,30 @@ mod linux {
             .layer_count(1);
         let start = Instant::now();
         let mut frames = 0u64;
+        // Diagnostic: the device's presenter acquires with timeout 0 and treats
+        // NOT_READY/TIMEOUT as busy. KMS_SPIKE_ACQUIRE_TIMEOUT_NS=0 does the same
+        // and counts what the driver answers instead of blocking.
+        let acquire_timeout: u64 = std::env::var("KMS_SPIKE_ACQUIRE_TIMEOUT_NS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(u64::MAX);
+        let mut acquire_answers: std::collections::BTreeMap<String, u64> = Default::default();
         while start.elapsed() < duration {
             let colour = COLOURS[(start.elapsed().as_secs() % 3) as usize];
-            let (index, _) = swapchain_ext
-                .acquire_next_image(swapchain, u64::MAX, acquired, vk::Fence::null())
-                .step("acquire_next_image")?;
+            let index = match swapchain_ext.acquire_next_image(
+                swapchain,
+                acquire_timeout,
+                acquired,
+                vk::Fence::null(),
+            ) {
+                Ok((index, _)) => index,
+                Err(result) if acquire_timeout != u64::MAX => {
+                    *acquire_answers.entry(format!("{result:?}")).or_default() += 1;
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Err(result) => return Err(Failed("acquire_next_image", result)),
+            };
             let image = images[index as usize];
             device
                 .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
@@ -546,6 +565,9 @@ mod linux {
                 .step("wait_for_fences")?;
             device.reset_fences(&[fence]).step("reset_fences")?;
             frames += 1;
+        }
+        if acquire_timeout != u64::MAX {
+            println!("kms_spike acquire_timeout_ns={acquire_timeout} refused={acquire_answers:?}");
         }
         Ok(frames)
     }

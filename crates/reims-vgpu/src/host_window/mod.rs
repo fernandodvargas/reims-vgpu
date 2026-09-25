@@ -31,4 +31,5 @@
 pub mod capture;
 pub mod input_map;
 pub mod keyboard;
+pub mod pointer;
 pub mod present;

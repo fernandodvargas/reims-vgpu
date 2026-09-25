@@ -262,13 +262,8 @@ impl Backend for VulkanBackend {
 
     #[cfg(feature = "host-window")]
     fn window_attach(&self, surface: &window::WindowSurface) -> Result<(), window::WindowDecline> {
-        engine::window_present_attach(
-            surface.display,
-            surface.window,
-            surface.width,
-            surface.height,
-        )
-        .map_err(window_decline)
+        engine::window_present_attach(surface.source, surface.width, surface.height)
+            .map_err(window_decline)
     }
 
     #[cfg(feature = "host-window")]

@@ -127,6 +127,11 @@ pub mod host_window;
 #[cfg(all(feature = "host-display", target_os = "linux"))]
 pub mod host_display;
 
+/// Host keyboard and mouse from evdev, with exclusive grab, for the
+/// direct-to-display output. Linux-only, like `host_display`.
+#[cfg(all(feature = "host-input", target_os = "linux"))]
+pub mod host_input;
+
 /// The device registry and the entry surface `qemu::abi` wraps. Private, with
 /// the names that surface reaches re-exported below — the shape
 /// `display_surface` and `window_publish` already use.

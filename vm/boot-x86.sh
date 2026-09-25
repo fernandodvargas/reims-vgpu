@@ -213,6 +213,8 @@ Env: DISKS_DIR OVMF_DIR RAILS_DIR RAIL RUN_DIR QEMU_BIN OVMF_CODE OVMF_VARS_MAST
      NET=user (SLIRP, default) | NET=none (no NIC)
      REIMS_VGPU_PCI_ATTACH=pcibridge|bus0   (default pcibridge; product secondary bus)
      REIMS_VGPU_GOP_ROM=path | REIMS_VGPU_GOP_ROM= (option ROM on reims-vgpu-pci; auto if built)
+     REIMS_VGPU_OUTPUT=window|kms (default window; kms = DRM connector, no display server)
+       REIMS_VGPU_DRM_CARD (default /dev/dri/card1)  REIMS_VGPU_CONNECTOR (e.g. HDMI-A-1)
      QEMU_REBOOT_ACTION=exit|pause|reset
        (default exit — guest reboot/KP-reset → QEMU quits; serial already on disk)
      TRACE=1 — QEMU trace events → \$RUN_DIR/trace-<stamp>.log
@@ -697,7 +699,24 @@ case "${REIMS_VGPU_WINDOW:-}" in
   *) export REIMS_VGPU_WINDOW=1 ;;
 esac
 
-if [ -n "${REIMS_VGPU_WINDOW:-}" ]; then
+# Where the host-owned output goes (read by the staticlib): `window` (default,
+# the winit window above) or `kms` — straight to a DRM connector with this QEMU
+# as DRM master, no Wayland or X at all (REIMS_VGPU_DRM_CARD,
+# REIMS_VGPU_CONNECTOR). A KMS refusal ends QEMU with its own exit code; it never
+# falls back to a window or to QEMU's display.
+REIMS_VGPU_OUTPUT="${REIMS_VGPU_OUTPUT:-window}"
+case "$REIMS_VGPU_OUTPUT" in
+  window|kms) export REIMS_VGPU_OUTPUT ;;
+  *) die "REIMS_VGPU_OUTPUT must be window or kms, not '$REIMS_VGPU_OUTPUT'" ;;
+esac
+if [ "$REIMS_VGPU_OUTPUT" = kms ] && [ -z "${REIMS_VGPU_WINDOW:-}" ]; then
+  die "REIMS_VGPU_OUTPUT=kms needs the host-owned output (REIMS_VGPU_WINDOW on, reims-vgpu-pci)"
+fi
+
+if [ -n "${REIMS_VGPU_WINDOW:-}" ] && [ "$REIMS_VGPU_OUTPUT" = kms ]; then
+  # No display server to find or to warn about: the staticlib takes the screen.
+  REIMS_VGPU_DISPLAY="${REIMS_VGPU_DISPLAY:-none}"
+elif [ -n "${REIMS_VGPU_WINDOW:-}" ]; then
   REIMS_VGPU_DISPLAY="${REIMS_VGPU_DISPLAY:-none}"
   # winit (in the staticlib) needs a display connection to open the window, and
   # QEMU inherits these from this script's environment. When launched from a
@@ -932,7 +951,8 @@ while kill -0 "$QEMU_PID" 2>/dev/null; do
   elapsed=$((elapsed + 5))
 done
 
-wait "$QEMU_PID" 2>/dev/null || true
+QEMU_RC=0
+wait "$QEMU_PID" 2>/dev/null || QEMU_RC=$?
 # QEMU exiting on its own is normally a guest shutdown, but `-action
 # reboot=shutdown` makes a panic reboot look identical. Check before saying
 # nothing happened.
@@ -941,3 +961,9 @@ if serial_has_panic; then
   exit 126
 fi
 capture_then_revert "qemu exited"
+# 70-75: the KMS output refused to take the screen (REIMS_VGPU_OUTPUT=kms;
+# host_display::run::DisplayError::exit_code). The boot failed, and says why.
+if [ "$QEMU_RC" -ge 70 ] && [ "$QEMU_RC" -le 75 ]; then
+  echo "boot-x86.sh: KMS output refused (qemu exit $QEMU_RC) — see 'reims-vgpu-display: refused'"
+  exit "$QEMU_RC"
+fi

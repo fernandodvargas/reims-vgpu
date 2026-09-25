@@ -230,6 +230,12 @@ pub fn gfx_write<H: HostMemory + HostOps>(
                         state.cursor.y,
                         state.cursor.show,
                     ));
+                    #[cfg(all(feature = "host-display", target_os = "linux"))]
+                    crate::host_display::cursor::publish_position(
+                        state.cursor.x,
+                        state.cursor.y,
+                        state.cursor.show,
+                    );
                 }
                 host.enqueue(HostAction::irq_gfx());
                 host.schedule_bh();

@@ -16,5 +16,8 @@
 //! Every failure to take the screen is a typed refusal with its own slug, never
 //! a silent fall back to the window or to QEMU's console.
 
+pub mod capture;
+pub mod cursor;
 pub mod drm;
+pub mod run;
 pub mod select;

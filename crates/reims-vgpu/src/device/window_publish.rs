@@ -90,6 +90,10 @@ pub(crate) struct WindowLink {
     /// the window's Vulkan objects tear down before QEMU teardown proceeds
     /// (avoids the driver-unload-during-exit crash class).
     thread: Option<std::thread::JoinHandle<Result<(), crate::host_window::present::WindowError>>>,
+    /// The display and input threads of the KMS output (`REIMS_VGPU_OUTPUT=kms`),
+    /// in place of `thread`; joined on stop the same way.
+    #[cfg(not(target_os = "macos"))]
+    kms_threads: Vec<std::thread::JoinHandle<()>>,
     /// Published after the process-main AppKit loop has destroyed the native
     /// window and its Vulkan objects.
     #[cfg(target_os = "macos")]
@@ -108,6 +112,25 @@ pub(crate) struct EarlyFb {
     stride: u32,
     width: u32,
     height: u32,
+}
+
+/// Where the guest's frames go: the `winit` window (the default) or straight to
+/// a DRM connector (`REIMS_VGPU_OUTPUT=kms`, M3).
+#[cfg(all(feature = "host-window", not(target_os = "macos")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Output {
+    Window,
+    Kms,
+}
+
+/// Parse `REIMS_VGPU_OUTPUT`; the unrecognised value comes back as the error.
+#[cfg(all(feature = "host-window", not(target_os = "macos")))]
+pub(crate) fn output_requested(value: Option<&str>) -> Result<Output, String> {
+    match value {
+        None | Some("") | Some("window") => Ok(Output::Window),
+        Some("kms") => Ok(Output::Kms),
+        Some(other) => Err(other.to_owned()),
+    }
 }
 
 /// Start the host-owned presentation window for `id` ([[host-window]]).
@@ -211,13 +234,61 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
         (None, exited)
     };
     #[cfg(not(target_os = "macos"))]
-    let thread = Some(crate::host_window::present::spawn(
-        cfg,
-        on_input,
-        Arc::clone(&frames),
-        Arc::clone(&stop),
-        Arc::clone(&wake),
-    ));
+    let output = match output_requested(std::env::var("REIMS_VGPU_OUTPUT").ok().as_deref()) {
+        Ok(output) => output,
+        Err(value) => {
+            crate::observe::fail(format!(
+                "host_window_start reason=bad_output id={id} value={}",
+                crate::host_window::present::detail_field(&value)
+            ));
+            return false;
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut kms_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    #[cfg(not(target_os = "macos"))]
+    let thread = match output {
+        Output::Window => Some(crate::host_window::present::spawn(
+            cfg,
+            on_input,
+            Arc::clone(&frames),
+            Arc::clone(&stop),
+            Arc::clone(&wake),
+        )),
+        #[cfg(all(feature = "host-display", target_os = "linux"))]
+        Output::Kms => {
+            match crate::host_display::run::spawn(
+                Arc::clone(&frames),
+                Arc::clone(&stop),
+                Arc::clone(&wake),
+            ) {
+                Ok(display) => kms_threads.push(display),
+                // Never QEMU's own display instead: the boot ends, typed.
+                // `spawn` already logged the refusal.
+                Err(error) => std::process::exit(error.exit_code()),
+            }
+            #[cfg(feature = "host-input")]
+            kms_threads.push(crate::host_input::devices::spawn(
+                on_input,
+                cfg.width,
+                cfg.height,
+                Arc::clone(&stop),
+            ));
+            #[cfg(not(feature = "host-input"))]
+            {
+                let _ = on_input;
+                eprintln!(
+                    "reims-vgpu-display: WARN built without host-input, no keyboard or mouse"
+                );
+            }
+            None
+        }
+        #[cfg(not(all(feature = "host-display", target_os = "linux")))]
+        Output::Kms => {
+            crate::observe::fail(format!("host_window_start reason=kms_not_built id={id}"));
+            return false;
+        }
+    };
     *link = Some(WindowLink {
         frames,
         wake,
@@ -226,6 +297,8 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
         bgra_short_geom: None,
         stop,
         thread,
+        #[cfg(not(target_os = "macos"))]
+        kms_threads,
         #[cfg(target_os = "macos")]
         exited,
     });
@@ -467,6 +540,11 @@ pub fn device_window_stop(id: u64) -> bool {
             Err(_) => {}
         }
     }
+    #[cfg(not(target_os = "macos"))]
+    for kms_thread in link.kms_threads.drain(..) {
+        // Each logs its own ending; a panic already wrote to stderr.
+        let _ = kms_thread.join();
+    }
     true
 }
 
@@ -596,4 +674,17 @@ fn copy_early_bar1(slot: &BoundDevice, dst: &mut [u8], dst_stride: u32, w: u32, 
         dst[doff..doff + row].copy_from_slice(&src[so..so + row]);
     }
     true
+}
+
+#[cfg(all(test, feature = "host-window", not(target_os = "macos")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_defaults_to_the_window_and_accepts_kms() {
+        assert_eq!(output_requested(None), Ok(Output::Window));
+        assert_eq!(output_requested(Some("window")), Ok(Output::Window));
+        assert_eq!(output_requested(Some("kms")), Ok(Output::Kms));
+        assert!(output_requested(Some("drm")).is_err());
+    }
 }

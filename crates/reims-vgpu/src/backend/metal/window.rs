@@ -46,7 +46,7 @@ use raw_window_handle::RawWindowHandle;
 use super::raw_metal;
 use super::runtime::{cached_default_sampler, system_device, thread_queue};
 use crate::backend::window::viewport::aspect_fit;
-use crate::backend::window::{WindowCpuFrame, WindowPresentOutcome, WindowSurface};
+use crate::backend::window::{SurfaceSource, WindowCpuFrame, WindowPresentOutcome, WindowSurface};
 use crate::observe::Decline;
 
 /// The layer's and the staging texture's pixel format.
@@ -311,7 +311,11 @@ pub fn detach() {
 
 impl Presenter {
     fn create(surface: &WindowSurface) -> Result<Self, MetalWindowDecline> {
-        let RawWindowHandle::AppKit(handle) = surface.window else {
+        let SurfaceSource::Native {
+            window: RawWindowHandle::AppKit(handle),
+            ..
+        } = surface.source
+        else {
             return Err(MetalWindowDecline::NotAppKitWindow);
         };
         let device = system_device().ok_or(MetalWindowDecline::NoDevice)?;

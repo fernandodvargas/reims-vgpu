@@ -281,6 +281,16 @@ pub enum DrawReason {
     QueueCannotPresent {
         queue_family: u32,
     },
+    /// The acquired display lists no mode of the size `host_display` chose.
+    #[cfg(all(feature = "host-display", target_os = "linux"))]
+    DisplayModeMissing {
+        width: u32,
+        height: u32,
+        refresh_mhz: u32,
+    },
+    /// No display plane of the device can show the acquired display.
+    #[cfg(all(feature = "host-display", target_os = "linux"))]
+    DisplayPlaneMissing,
     /// The host window's surface cannot carry this composition: no formats at
     /// all, not the scanout format, not under a colour space this device writes
     /// through, no transfer destination for the present blit, or no
@@ -393,6 +403,10 @@ impl crate::observe::Decline for DrawReason {
             }
             Self::SwapchainUnavailable => "swapchain_unavailable",
             Self::QueueCannotPresent { .. } => "queue_cannot_present",
+            #[cfg(all(feature = "host-display", target_os = "linux"))]
+            Self::DisplayModeMissing { .. } => "display_mode_missing",
+            #[cfg(all(feature = "host-display", target_os = "linux"))]
+            Self::DisplayPlaneMissing => "display_plane_missing",
             Self::SwapchainSurface(refusal) => refusal.slug(),
         }
     }
@@ -477,6 +491,15 @@ impl std::fmt::Display for DrawReason {
                 write!(f, " memory_type_bits={memory_type_bits:#x}")
             }
             Self::QueueCannotPresent { queue_family } => write!(f, " queue_family={queue_family}"),
+            #[cfg(all(feature = "host-display", target_os = "linux"))]
+            Self::DisplayModeMissing {
+                width,
+                height,
+                refresh_mhz,
+            } => write!(
+                f,
+                " width={width} height={height} refresh_mhz={refresh_mhz}"
+            ),
             Self::DescriptorArrayUnsupported {
                 binding,
                 count,
@@ -725,6 +748,14 @@ mod tests {
         },
         DrawReason::SwapchainUnavailable,
         DrawReason::QueueCannotPresent { queue_family: 0 },
+        #[cfg(all(feature = "host-display", target_os = "linux"))]
+        DrawReason::DisplayModeMissing {
+            width: 0,
+            height: 0,
+            refresh_mhz: 0,
+        },
+        #[cfg(all(feature = "host-display", target_os = "linux"))]
+        DrawReason::DisplayPlaneMissing,
         DrawReason::SwapchainSurface(reims_vgpu_vulkan::swapchain::Refusal::NoFormats),
         DrawReason::SwapchainSurface(reims_vgpu_vulkan::swapchain::Refusal::FormatNotOffered {
             wanted: ash::vk::Format::B8G8R8A8_UNORM,

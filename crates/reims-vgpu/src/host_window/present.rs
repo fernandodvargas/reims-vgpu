@@ -100,7 +100,7 @@ use crate::runtime::host::HostAction;
 /// produced 3074 of those draws: the other 508 were superseded in the slot
 /// before the loop looked, which is latest-wins working rather than a frame
 /// lost.
-const WINDOW_REDRAW_BACKSTOP: std::time::Duration =
+pub(crate) const WINDOW_REDRAW_BACKSTOP: std::time::Duration =
     std::time::Duration::from_millis(GUEST_RESIZE_WARN_AFTER.as_millis() as u64 / 10);
 /// How many rebuilds of the presenter may go unproven before the window stops
 /// trying — asked of the running rail, which is what gets lost.
@@ -266,8 +266,14 @@ pub struct FramePublished;
 /// carry an `mpsc::Sender` — so it cannot be shared behind a `OnceLock`. The
 /// lock is uncontended and taken once per published frame, at the ~26 Hz this
 /// workload peaks at, against the publisher's own two existing locks.
+///
+/// # The channel
+///
+/// The direct-to-display loop (`host_display`) has no winit event loop; it is
+/// armed with a one-slot channel instead, and sleeps on its receiver.
 pub struct WindowWaker {
     proxy: Mutex<Option<winit::event_loop::EventLoopProxy<FramePublished>>>,
+    channel: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
 }
 
 /// A [`WindowWaker`] shared between the device's publisher and the window
@@ -280,6 +286,7 @@ impl WindowWaker {
     pub fn new() -> WindowWakeHandle {
         Arc::new(Self {
             proxy: Mutex::new(None),
+            channel: Mutex::new(None),
         })
     }
 
@@ -287,6 +294,13 @@ impl WindowWaker {
     fn arm(&self, proxy: winit::event_loop::EventLoopProxy<FramePublished>) {
         if let Ok(mut slot) = self.proxy.lock() {
             *slot = Some(proxy);
+        }
+    }
+
+    /// Arm with a channel, for a loop that is not winit's.
+    pub fn arm_channel(&self, tx: std::sync::mpsc::SyncSender<()>) {
+        if let Ok(mut slot) = self.channel.lock() {
+            *slot = Some(tx);
         }
     }
 
@@ -298,10 +312,16 @@ impl WindowWaker {
     /// every case [`WINDOW_REDRAW_BACKSTOP`] still runs, so a wake that
     /// does not land costs latency bounded by that constant rather than a frame
     /// — which is the property that lets this be a wake and not a protocol.
+    /// A full channel is a wake already pending, not a lost one.
     pub fn wake(&self) {
         if let Ok(slot) = self.proxy.lock() {
             if let Some(proxy) = slot.as_ref() {
                 let _ = proxy.send_event(FramePublished);
+            }
+        }
+        if let Ok(slot) = self.channel.lock() {
+            if let Some(tx) = slot.as_ref() {
+                let _ = tx.try_send(());
             }
         }
     }
@@ -314,7 +334,7 @@ impl WindowWaker {
 /// rendered into. `bgra` is empty on presents the device elided the readback
 /// for, and the presenter rejects a short buffer rather than blitting a torn
 /// frame.
-fn window_cpu_frame(frame: &Frame) -> crate::backend::window::WindowCpuFrame<'_> {
+pub(crate) fn window_cpu_frame(frame: &Frame) -> crate::backend::window::WindowCpuFrame<'_> {
     crate::backend::window::WindowCpuFrame {
         bgra: &frame.bgra,
         width: frame.width,
@@ -330,7 +350,11 @@ fn window_cpu_frame(frame: &Frame) -> crate::backend::window::WindowCpuFrame<'_>
 /// guest has not produced a different frame, so the only reasons to pay it are a
 /// new frame seq or a drawable that must be rebuilt (first frame, resize,
 /// suboptimal swapchain).
-fn needs_present(presented: Option<u64>, redraw_required: bool, incoming: Option<u64>) -> bool {
+pub(crate) fn needs_present(
+    presented: Option<u64>,
+    redraw_required: bool,
+    incoming: Option<u64>,
+) -> bool {
     redraw_required || presented != incoming
 }
 
@@ -535,7 +559,7 @@ impl WindowError {
 
 /// Collapse whitespace runs to single `_` so a driver/winit string is safe as a
 /// log field value ([`crate::observe::Emit`] splits the line on spaces).
-pub(super) fn detail_field(s: &str) -> String {
+pub(crate) fn detail_field(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join("_")
 }
 
@@ -1305,8 +1329,10 @@ impl App {
         let size = window.inner_size();
         crate::backend::selected()
             .window_attach(&crate::backend::window::WindowSurface {
-                display,
-                window: handle,
+                source: crate::backend::window::SurfaceSource::Native {
+                    display,
+                    window: handle,
+                },
                 width: size.width.max(1),
                 height: size.height.max(1),
             })
@@ -1594,6 +1620,17 @@ mod loop_census_tests {
 #[cfg(test)]
 mod wake_tests {
     use super::*;
+
+    /// The display loop has no winit event loop: it is armed with a channel,
+    /// and each publish's wake must reach it.
+    #[test]
+    fn a_channel_armed_waker_delivers_each_wake() {
+        let waker = WindowWaker::new();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        waker.arm_channel(tx);
+        waker.wake();
+        assert!(rx.try_recv().is_ok());
+    }
 
     /// A wake that finds nothing armed is a no-op, not a panic and not a
     /// refusal.

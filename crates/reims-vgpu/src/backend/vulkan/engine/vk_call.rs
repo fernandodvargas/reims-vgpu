@@ -292,6 +292,24 @@ pub enum VkOp {
     //      initial-bring-up and swapchain-recreate paths shares one op. ----
     /// `ash_window::create_surface` for the host window.
     WindowCreateSurface,
+    /// `vkGetDrmDisplayEXT`: the DRM connector as a `VkDisplayKHR`.
+    #[cfg(all(feature = "host-display", target_os = "linux"))]
+    DisplayGet,
+    /// `vkAcquireDrmDisplayEXT`: take the display for this process.
+    #[cfg(all(feature = "host-display", target_os = "linux"))]
+    DisplayAcquire,
+    /// `vkGetDisplayModePropertiesKHR` for the acquired display.
+    #[cfg(all(feature = "host-display", target_os = "linux"))]
+    DisplayModeProperties,
+    /// `vkGetPhysicalDeviceDisplayPlanePropertiesKHR`.
+    #[cfg(all(feature = "host-display", target_os = "linux"))]
+    DisplayPlaneProperties,
+    /// `vkGetDisplayPlaneSupportedDisplaysKHR` for one plane.
+    #[cfg(all(feature = "host-display", target_os = "linux"))]
+    DisplayPlaneSupported,
+    /// `vkCreateDisplayPlaneSurfaceKHR`.
+    #[cfg(all(feature = "host-display", target_os = "linux"))]
+    DisplayCreateSurface,
     /// `vkGetPhysicalDeviceSurfaceSupportKHR` for the present queue family.
     WindowSurfaceSupport,
     /// `vkCreateCommandPool` for the presenter's blit command pool.
@@ -483,6 +501,18 @@ impl Decline for VkCall {
             VkOp::PoolsCreateMrtFramebuffer => "vk_pools_create_mrt_framebuffer",
 
             VkOp::WindowCreateSurface => "vk_window_create_surface",
+            #[cfg(all(feature = "host-display", target_os = "linux"))]
+            VkOp::DisplayGet => "vk_display_get",
+            #[cfg(all(feature = "host-display", target_os = "linux"))]
+            VkOp::DisplayAcquire => "vk_display_acquire",
+            #[cfg(all(feature = "host-display", target_os = "linux"))]
+            VkOp::DisplayModeProperties => "vk_display_mode_properties",
+            #[cfg(all(feature = "host-display", target_os = "linux"))]
+            VkOp::DisplayPlaneProperties => "vk_display_plane_properties",
+            #[cfg(all(feature = "host-display", target_os = "linux"))]
+            VkOp::DisplayPlaneSupported => "vk_display_plane_supported",
+            #[cfg(all(feature = "host-display", target_os = "linux"))]
+            VkOp::DisplayCreateSurface => "vk_display_create_surface",
             VkOp::WindowSurfaceSupport => "vk_window_surface_support",
             VkOp::WindowCreateCommandPool => "vk_window_create_command_pool",
             VkOp::WindowAllocCommandBuffer => "vk_window_alloc_command_buffer",
@@ -649,6 +679,18 @@ mod tests {
         VkOp::PoolsCreateDepthView,
         VkOp::PoolsCreateMrtFramebuffer,
         VkOp::WindowCreateSurface,
+        #[cfg(all(feature = "host-display", target_os = "linux"))]
+        VkOp::DisplayGet,
+        #[cfg(all(feature = "host-display", target_os = "linux"))]
+        VkOp::DisplayAcquire,
+        #[cfg(all(feature = "host-display", target_os = "linux"))]
+        VkOp::DisplayModeProperties,
+        #[cfg(all(feature = "host-display", target_os = "linux"))]
+        VkOp::DisplayPlaneProperties,
+        #[cfg(all(feature = "host-display", target_os = "linux"))]
+        VkOp::DisplayPlaneSupported,
+        #[cfg(all(feature = "host-display", target_os = "linux"))]
+        VkOp::DisplayCreateSurface,
         VkOp::WindowSurfaceSupport,
         VkOp::WindowCreateCommandPool,
         VkOp::WindowAllocCommandBuffer,

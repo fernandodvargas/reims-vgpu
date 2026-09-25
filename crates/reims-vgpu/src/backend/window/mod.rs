@@ -31,15 +31,36 @@ use crate::observe::Decline;
 
 /// The native surface a rail attaches its presenter to.
 ///
-/// The handles come from `winit` and are only valid while the window that
-/// vended them is alive, which is why attach and detach are both driven from
-/// the window's own lifecycle callbacks rather than from the device.
+/// A `Native` source's handles come from `winit` and are only valid while the
+/// window that vended them is alive, which is why attach and detach are both
+/// driven from the window's own lifecycle callbacks rather than from the device.
 #[derive(Clone, Copy)]
 pub struct WindowSurface {
-    pub display: raw_window_handle::RawDisplayHandle,
-    pub window: raw_window_handle::RawWindowHandle,
+    pub source: SurfaceSource,
     pub width: u32,
     pub height: u32,
+}
+
+/// Where the presenter's surface comes from.
+#[derive(Clone, Copy, Debug)]
+pub enum SurfaceSource {
+    /// A window-system window (`winit`): the rail builds a platform surface.
+    Native {
+        display: raw_window_handle::RawDisplayHandle,
+        window: raw_window_handle::RawWindowHandle,
+    },
+    /// A DRM connector this process takes as master (`host_display`): the rail
+    /// acquires it as a `VkDisplayKHR` and builds a display plane surface in
+    /// the mode given. `drm_fd` stays owned by the caller and open for as long
+    /// as the presenter lives.
+    #[cfg(all(feature = "host-display", target_os = "linux"))]
+    Display {
+        drm_fd: std::os::fd::RawFd,
+        connector_id: u32,
+        width: u32,
+        height: u32,
+        refresh_mhz: u32,
+    },
 }
 
 /// A published frame's CPU bytes, offered to a rail's presenter.

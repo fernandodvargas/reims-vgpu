@@ -55,6 +55,8 @@ pub mod types;
 pub mod vk_call;
 #[cfg(feature = "host-window")]
 mod window_present;
+#[cfg(all(feature = "host-display", target_os = "linux"))]
+pub use window_present::CapturedFrame;
 
 pub use context::MAX_DEVICE_RECREATES;
 pub(crate) use counters::{CounterSnapshot, EngineCounters, TargetReadDelivery};
@@ -1133,8 +1135,7 @@ pub fn reset_guest_state() -> GuestResetStats {
 /// Vulkan instance/device.
 #[cfg(feature = "host-window")]
 pub fn window_present_attach(
-    display: raw_window_handle::RawDisplayHandle,
-    window: raw_window_handle::RawWindowHandle,
+    source: crate::backend::window::SurfaceSource,
     width: u32,
     height: u32,
 ) -> Result<(), DrawError> {
@@ -1149,9 +1150,8 @@ pub fn window_present_attach(
         return Ok(());
     }
     let ctx = owner.ensure(counters)?;
-    *window_presenter = Some(unsafe {
-        window_present::WindowPresenter::create(ctx, display, window, width, height)?
-    });
+    *window_presenter =
+        Some(unsafe { window_present::WindowPresenter::create(ctx, source, width, height)? });
     note_window_present_attached(true);
     Ok(())
 }
@@ -1190,6 +1190,29 @@ fn note_window_present_attached(attached: bool) {
 #[cfg(feature = "host-window")]
 pub fn window_present_attached() -> bool {
     WINDOW_PRESENT_ATTACHED.load(Ordering::Acquire)
+}
+
+/// Capture the next display present to `path` (`host_display::capture`). Only a
+/// display plane surface serves it; a window presenter leaves it pending.
+#[cfg(all(feature = "host-display", target_os = "linux"))]
+pub fn window_capture_next(path: std::path::PathBuf) {
+    window_present::request_capture(path);
+}
+
+/// The captured image, once the present that copied it has completed. The
+/// caller writes it out, away from the engine lock.
+#[cfg(all(feature = "host-display", target_os = "linux"))]
+pub fn window_capture_take() -> Option<window_present::CapturedFrame> {
+    let mut guard = lock_engine_at(EngineLockSite::Window);
+    let EngineState {
+        ref mut owner,
+        ref counters,
+        ref mut window_presenter,
+        ..
+    } = &mut *guard;
+    let presenter = window_presenter.as_mut()?;
+    let ctx = owner.ensure(counters).ok()?;
+    unsafe { presenter.take_capture(ctx) }
 }
 
 #[cfg(feature = "host-window")]

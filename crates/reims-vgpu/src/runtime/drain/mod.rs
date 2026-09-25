@@ -6260,6 +6260,8 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 state.cursor.show = show;
                 sample_cursor_position(state, host);
                 host.enqueue(HostAction::cursor(state.cursor.x, state.cursor.y, show));
+                #[cfg(all(feature = "host-display", target_os = "linux"))]
+                crate::host_display::cursor::publish_position(state.cursor.x, state.cursor.y, show);
             }
             Err(short) => note_short_payload("cursor_show", Some(channel_id), &short),
         },
@@ -6271,6 +6273,22 @@ fn process_child_packet<H: HostMemory + HostOps>(
                     state.cursor.y,
                     state.cursor.show,
                 ));
+                // The KMS output draws the cursor on a plane of its own; QEMU's
+                // console never sees these actions there.
+                #[cfg(all(feature = "host-display", target_os = "linux"))]
+                {
+                    let c = &state.cursor;
+                    crate::host_display::cursor::publish_glyph(
+                        crate::host_display::cursor::Glyph {
+                            width: c.width,
+                            height: c.height,
+                            hot_x: c.hot_x,
+                            hot_y: c.hot_y,
+                            pixels: c.pixels.clone(),
+                        },
+                    );
+                    crate::host_display::cursor::publish_position(c.x, c.y, c.show);
+                }
             }
         }
         CHILD_OP_EXEC_INDIRECT2 => {

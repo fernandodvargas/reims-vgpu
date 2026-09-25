@@ -14,6 +14,17 @@ use super::select::{Connector, Mode};
 
 const DRM_IOCTL_MODE_GETRESOURCES: libc::c_ulong = 0xC040_64A0;
 const DRM_IOCTL_MODE_GETCONNECTOR: libc::c_ulong = 0xC050_64A7;
+/// `DRM_IOW(0x11, struct drm_auth)`.
+const DRM_IOCTL_AUTH_MAGIC: libc::c_ulong = 0x4004_6411;
+const DRM_IOCTL_GET_CAP: libc::c_ulong = 0xC010_640C;
+const DRM_IOCTL_MODE_GETENCODER: libc::c_ulong = 0xC014_64A6;
+const DRM_IOCTL_MODE_CREATE_DUMB: libc::c_ulong = 0xC020_64B2;
+const DRM_IOCTL_MODE_MAP_DUMB: libc::c_ulong = 0xC010_64B3;
+const DRM_IOCTL_MODE_DESTROY_DUMB: libc::c_ulong = 0xC004_64B4;
+const DRM_IOCTL_MODE_CURSOR2: libc::c_ulong = 0xC024_64BB;
+const DRM_CAP_CURSOR_WIDTH: u64 = 0x8;
+const DRM_MODE_CURSOR_BO: u32 = 0x01;
+const DRM_MODE_CURSOR_MOVE: u32 = 0x02;
 const DRM_MODE_TYPE_PREFERRED: u32 = 1 << 3;
 const DRM_MODE_CONNECTED: u32 = 1;
 const MODEINFO_SIZE: usize = 68;
@@ -76,6 +87,19 @@ impl Card {
         self.file.as_raw_fd()
     }
 
+    /// Whether this open file is the card's DRM master, the way libdrm's
+    /// `drmIsMaster` asks: `DRM_IOCTL_AUTH_MAGIC` is master-only, so it fails
+    /// with `EACCES` for anyone else, and magic 0 is never valid, so a master
+    /// gets a harmless `EINVAL`. The first opener of a card with no master
+    /// becomes master; a card another process already drives stays theirs.
+    pub fn is_master(&self) -> bool {
+        let mut magic: u32 = 0;
+        !matches!(
+            ioctl(self.fd(), DRM_IOCTL_AUTH_MAGIC, &mut magic),
+            Err(error) if error.raw_os_error() == Some(libc::EACCES)
+        )
+    }
+
     /// Every connector of the card, with its modes in kernel order.
     pub fn connectors(&self) -> io::Result<Vec<Connector>> {
         let ids = self.connector_ids()?;
@@ -135,6 +159,228 @@ impl Card {
                 modes,
             });
         }
+    }
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct GetEncoder {
+    encoder_id: u32,
+    encoder_type: u32,
+    crtc_id: u32,
+    possible_crtcs: u32,
+    possible_clones: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct CreateDumb {
+    height: u32,
+    width: u32,
+    bpp: u32,
+    flags: u32,
+    handle: u32,
+    pitch: u32,
+    size: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct MapDumb {
+    handle: u32,
+    pad: u32,
+    offset: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct Cursor2 {
+    flags: u32,
+    crtc_id: u32,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    handle: u32,
+    hot_x: i32,
+    hot_y: i32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct GetCap {
+    capability: u64,
+    value: u64,
+}
+
+impl Card {
+    /// The CRTC driving `connector_id` right now; `None` before the first
+    /// modeset has bound one.
+    pub fn crtc_of(&self, connector_id: u32) -> io::Result<Option<u32>> {
+        let mut conn = GetConnector {
+            connector_id,
+            ..GetConnector::default()
+        };
+        // count_modes stays 1 so the kernel does not re-probe the connector.
+        let mut one_mode = [0u8; MODEINFO_SIZE];
+        conn.modes_ptr = one_mode.as_mut_ptr() as u64;
+        conn.count_modes = 1;
+        ioctl(self.fd(), DRM_IOCTL_MODE_GETCONNECTOR, &mut conn)?;
+        if conn.encoder_id == 0 {
+            return Ok(None);
+        }
+        let mut enc = GetEncoder {
+            encoder_id: conn.encoder_id,
+            ..GetEncoder::default()
+        };
+        ioctl(self.fd(), DRM_IOCTL_MODE_GETENCODER, &mut enc)?;
+        Ok((enc.crtc_id != 0).then_some(enc.crtc_id))
+    }
+
+    /// A cursor plane on `crtc_id`: a dumb ARGB8888 buffer of the size the
+    /// driver's cursor takes (`DRM_CAP_CURSOR_WIDTH`, 64 when unsaid), mapped.
+    pub fn cursor_plane(&self, crtc_id: u32) -> io::Result<CursorPlane> {
+        let mut cap = GetCap {
+            capability: DRM_CAP_CURSOR_WIDTH,
+            value: 0,
+        };
+        let size = match ioctl(self.fd(), DRM_IOCTL_GET_CAP, &mut cap) {
+            Ok(()) if (1..=512).contains(&cap.value) => cap.value as u32,
+            _ => 64,
+        };
+        let mut dumb = CreateDumb {
+            height: size,
+            width: size,
+            bpp: 32,
+            ..CreateDumb::default()
+        };
+        ioctl(self.fd(), DRM_IOCTL_MODE_CREATE_DUMB, &mut dumb)?;
+        let mut map = MapDumb {
+            handle: dumb.handle,
+            ..MapDumb::default()
+        };
+        let destroy = |fd, handle| {
+            let mut d = handle;
+            let _ = ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut d);
+        };
+        if let Err(error) = ioctl(self.fd(), DRM_IOCTL_MODE_MAP_DUMB, &mut map) {
+            destroy(self.fd(), dumb.handle);
+            return Err(error);
+        }
+        // SAFETY: mapping the dumb buffer the kernel just made, at the offset it
+        // named, for the size it reported.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                dumb.size as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                self.fd(),
+                map.offset as libc::off_t,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            let error = io::Error::last_os_error();
+            destroy(self.fd(), dumb.handle);
+            return Err(error);
+        }
+        Ok(CursorPlane {
+            fd: self.fd(),
+            crtc_id,
+            size,
+            handle: dumb.handle,
+            pitch: dumb.pitch,
+            map: ptr.cast(),
+            map_len: dumb.size as usize,
+            shown: false,
+        })
+    }
+}
+
+/// The CRTC's cursor plane, fed from a mapped dumb buffer. Hidden and freed on
+/// drop. Borrows the card's fd: the [`Card`] must outlive it.
+pub struct CursorPlane {
+    fd: RawFd,
+    crtc_id: u32,
+    size: u32,
+    handle: u32,
+    pitch: u32,
+    map: *mut u8,
+    map_len: usize,
+    shown: bool,
+}
+
+// SAFETY: the mapping is owned by this value alone and only written through
+// `&mut self`.
+unsafe impl Send for CursorPlane {}
+
+impl CursorPlane {
+    /// Side of the square image the plane takes.
+    pub fn size(&self) -> u32 {
+        self.size
+    }
+
+    /// Write a `size`x`size` ARGB8888 image into the buffer.
+    pub fn set_image(&mut self, argb: &[u32]) {
+        let size = self.size as usize;
+        for (y, row) in argb.chunks_exact(size).take(size).enumerate() {
+            let at = y * self.pitch as usize;
+            if at + size * 4 > self.map_len {
+                break;
+            }
+            // SAFETY: `at + size*4` is inside the mapping, checked above.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    row.as_ptr().cast::<u8>(),
+                    self.map.add(at),
+                    size * 4,
+                );
+            }
+        }
+        // The next show must hand the buffer over again for the new image.
+        self.shown = false;
+    }
+
+    /// Show the image with its top-left at `(x, y)` on the CRTC.
+    pub fn show_at(&mut self, x: i32, y: i32) -> io::Result<()> {
+        let mut cursor = Cursor2 {
+            flags: if self.shown {
+                DRM_MODE_CURSOR_MOVE
+            } else {
+                DRM_MODE_CURSOR_BO | DRM_MODE_CURSOR_MOVE
+            },
+            crtc_id: self.crtc_id,
+            x,
+            y,
+            width: self.size,
+            height: self.size,
+            handle: self.handle,
+            ..Cursor2::default()
+        };
+        ioctl(self.fd, DRM_IOCTL_MODE_CURSOR2, &mut cursor)?;
+        self.shown = true;
+        Ok(())
+    }
+
+    pub fn hide(&mut self) -> io::Result<()> {
+        let mut cursor = Cursor2 {
+            flags: DRM_MODE_CURSOR_BO,
+            crtc_id: self.crtc_id,
+            ..Cursor2::default()
+        };
+        ioctl(self.fd, DRM_IOCTL_MODE_CURSOR2, &mut cursor)?;
+        self.shown = false;
+        Ok(())
+    }
+}
+
+impl Drop for CursorPlane {
+    fn drop(&mut self) {
+        let _ = self.hide();
+        // SAFETY: unmapping the mapping this value made.
+        unsafe { libc::munmap(self.map.cast(), self.map_len) };
+        let mut handle = self.handle;
+        let _ = ioctl(self.fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut handle);
     }
 }
 

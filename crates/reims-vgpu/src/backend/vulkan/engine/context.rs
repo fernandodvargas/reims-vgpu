@@ -944,11 +944,24 @@ impl DeviceContext {
             // X11 and Wayland are both live on Linux desktops and the session
             // type is a runtime property, so both are offered and each is taken
             // only if advertised.
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(feature = "host-display")))]
             let platform: &[&CStr] = &[
                 ash::khr::xlib_surface::NAME,
                 ash::khr::xcb_surface::NAME,
                 ash::khr::wayland_surface::NAME,
+            ];
+            // The direct-to-display surface (M3): `VK_KHR_display` for the
+            // plane surface, and the two EXTs that turn a DRM connector into a
+            // `VkDisplayKHR` this process holds. Same rule: each only if
+            // advertised, and a missing one is an attach-time decline.
+            #[cfg(all(target_os = "linux", feature = "host-display"))]
+            let platform: &[&CStr] = &[
+                ash::khr::xlib_surface::NAME,
+                ash::khr::xcb_surface::NAME,
+                ash::khr::wayland_surface::NAME,
+                ash::khr::display::NAME,
+                ash::ext::direct_mode_display::NAME,
+                ash::ext::acquire_drm_display::NAME,
             ];
             // VK_KHR_win32_surface is the Windows host-window surface
             // extension; one arm per OS keeps each list exactly what that

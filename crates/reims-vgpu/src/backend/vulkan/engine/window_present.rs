@@ -7,8 +7,8 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use crate::backend::window::SurfaceSource;
 use ash::vk;
-use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
@@ -557,6 +557,333 @@ pub(crate) struct WindowPresenter {
     /// a second query is a second answer that could disagree with the one
     /// attach already refused on.
     present_family_supported: bool,
+    /// The DRM connector this presenter holds as a `VkDisplayKHR`, released
+    /// after the surface on [`Self::destroy`]. `None` for a window surface.
+    #[cfg(all(feature = "host-display", target_os = "linux"))]
+    display: Option<AcquiredDisplay>,
+    /// The swapchain images also carry `TRANSFER_SRC`, so a present can copy
+    /// what it is about to scan out. Set for a display surface, from creation,
+    /// because the first swapchain is built before `display` is filled in.
+    #[cfg(all(feature = "host-display", target_os = "linux"))]
+    capture_usage: bool,
+    /// A copy of a presented image on its way to host memory.
+    #[cfg(all(feature = "host-display", target_os = "linux"))]
+    capture_in_flight: Option<CaptureInFlight>,
+    /// When the current run of display acquires refused with
+    /// `ERROR_SURFACE_LOST_KHR` began; `None` after any acquire succeeds.
+    #[cfg(all(feature = "host-display", target_os = "linux"))]
+    display_lost_since: Option<Instant>,
+    /// A copy of the last image this display presented. See [`ScanoutCopy`].
+    #[cfg(all(feature = "host-display", target_os = "linux"))]
+    scanout_copy: Option<ScanoutCopy>,
+}
+
+/// What the connector is scanning out, kept on the GPU.
+///
+/// A window's compositor keeps showing the last buffer it was given; a display
+/// plane shows whatever this presenter puts in the next swapchain image. So a
+/// present with nothing to show — a publish whose source went stale while the
+/// desktop sat still, the only kind a capture request re-presents — would
+/// paint slate over a good desktop, on the glass and in the capture alike.
+/// Every display present copies its finished image here, and a present with
+/// no source shows this instead of slate: the screen keeps what it had.
+#[cfg(all(feature = "host-display", target_os = "linux"))]
+struct ScanoutCopy {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    width: u32,
+    height: u32,
+    /// A present has written it (it rests in `TRANSFER_SRC_OPTIMAL`).
+    ready: bool,
+}
+
+#[cfg(all(feature = "host-display", target_os = "linux"))]
+impl ScanoutCopy {
+    unsafe fn create(ctx: &DeviceContext, width: u32, height: u32) -> Result<Self, VkCall> {
+        let image = ctx
+            .device
+            .create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(translate::pixel::SCANOUT_FORMAT)
+                    .extent(vk::Extent3D {
+                        width,
+                        height,
+                        depth: 1,
+                    })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+                    .initial_layout(vk::ImageLayout::UNDEFINED),
+                None,
+            )
+            .map_err(|result| VkCall::new(VkOp::WindowCreateStagingImage, result))?;
+        let req = ctx.device.get_image_memory_requirements(image);
+        let Some(mem_type) = ctx.memory_type_for(
+            req.memory_type_bits,
+            req.size,
+            crate::backend::vulkan::caps::MemoryClass::DeviceLocalPreferred,
+        ) else {
+            ctx.device.destroy_image(image, None);
+            return Err(VkCall::new(
+                VkOp::WindowAllocateStagingMemory,
+                vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            ));
+        };
+        let memory = match ctx.device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(mem_type),
+            None,
+        ) {
+            Ok(memory) => memory,
+            Err(result) => {
+                ctx.device.destroy_image(image, None);
+                return Err(VkCall::new(VkOp::WindowAllocateStagingMemory, result));
+            }
+        };
+        if let Err(result) = ctx.device.bind_image_memory(image, memory, 0) {
+            ctx.device.destroy_image(image, None);
+            ctx.device.free_memory(memory, None);
+            return Err(VkCall::new(VkOp::WindowBindStagingMemory, result));
+        }
+        Ok(Self {
+            image,
+            memory,
+            width,
+            height,
+            ready: false,
+        })
+    }
+
+    unsafe fn destroy(self, device: &ash::Device) {
+        device.destroy_image(self.image, None);
+        device.free_memory(self.memory, None);
+    }
+}
+
+/// The next display present's image goes to this path (`host_display::capture`).
+#[cfg(all(feature = "host-display", target_os = "linux"))]
+static CAPTURE_REQUEST: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+/// Ask for the next display present to be captured to `path`. A second request
+/// before the first is served replaces it.
+#[cfg(all(feature = "host-display", target_os = "linux"))]
+pub(crate) fn request_capture(path: std::path::PathBuf) {
+    *CAPTURE_REQUEST.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+}
+
+/// A presented image, read back: tightly packed BGRA.
+#[cfg(all(feature = "host-display", target_os = "linux"))]
+pub struct CapturedFrame {
+    pub path: std::path::PathBuf,
+    pub width: u32,
+    pub height: u32,
+    pub bgra: Vec<u8>,
+}
+
+/// The buffer a present copied its swapchain image into, and the fence of
+/// that present's submission.
+#[cfg(all(feature = "host-display", target_os = "linux"))]
+struct CaptureInFlight {
+    path: std::path::PathBuf,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    width: u32,
+    height: u32,
+    fence: vk::Fence,
+}
+
+#[cfg(all(feature = "host-display", target_os = "linux"))]
+impl CaptureInFlight {
+    unsafe fn destroy(self, device: &ash::Device) {
+        device.destroy_buffer(self.buffer, None);
+        device.free_memory(self.memory, None);
+    }
+}
+
+/// A DRM connector acquired as a `VkDisplayKHR` (`VK_EXT_acquire_drm_display`).
+#[cfg(all(feature = "host-display", target_os = "linux"))]
+struct AcquiredDisplay {
+    display_loader: ash::khr::display::Instance,
+    direct_loader: ash::ext::direct_mode_display::Instance,
+    pd: vk::PhysicalDevice,
+    display: vk::DisplayKHR,
+}
+
+#[cfg(all(feature = "host-display", target_os = "linux"))]
+impl AcquiredDisplay {
+    /// `vkGetDrmDisplayEXT` then `vkAcquireDrmDisplayEXT`. The instance enables
+    /// the display extensions whenever the loader advertises them
+    /// (`context.rs`), so an unadvertised one is refused here, before any
+    /// function pointer is loaded.
+    unsafe fn acquire(
+        ctx: &DeviceContext,
+        drm_fd: std::os::fd::RawFd,
+        connector_id: u32,
+    ) -> Result<Self, DrawError> {
+        let advertised = ctx
+            ._entry
+            .enumerate_instance_extension_properties(None)
+            .unwrap_or_default();
+        let has = |name: &std::ffi::CStr| {
+            advertised
+                .iter()
+                .any(|e| std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) == name)
+        };
+        if ![
+            ash::khr::display::NAME,
+            ash::ext::direct_mode_display::NAME,
+            ash::ext::acquire_drm_display::NAME,
+        ]
+        .into_iter()
+        .all(has)
+        {
+            return Err(DrawError::VkCall(VkCall::new(
+                VkOp::DisplayGet,
+                vk::Result::ERROR_EXTENSION_NOT_PRESENT,
+            )));
+        }
+        let drm_loader = ash::ext::acquire_drm_display::Instance::new(&ctx._entry, &ctx.instance);
+        let display = drm_loader
+            .get_drm_display(ctx.pd, drm_fd, connector_id)
+            .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::DisplayGet, error)))?;
+        drm_loader
+            .acquire_drm_display(ctx.pd, drm_fd, display)
+            .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::DisplayAcquire, error)))?;
+        Ok(Self {
+            display_loader: ash::khr::display::Instance::new(&ctx._entry, &ctx.instance),
+            direct_loader: ash::ext::direct_mode_display::Instance::new(&ctx._entry, &ctx.instance),
+            pd: ctx.pd,
+            display,
+        })
+    }
+
+    /// A display plane surface on this display, in the mode of this size whose
+    /// refresh is nearest the one asked, on the first plane that can show it.
+    unsafe fn plane_surface(
+        &self,
+        width: u32,
+        height: u32,
+        refresh_mhz: u32,
+    ) -> Result<vk::SurfaceKHR, DrawError> {
+        let vk_call = |op| move |error| DrawError::VkCall(VkCall::new(op, error));
+        let modes = self
+            .display_loader
+            .get_display_mode_properties(self.pd, self.display)
+            .map_err(vk_call(VkOp::DisplayModeProperties))?;
+        let sizes: Vec<(u32, u32, u32)> = modes
+            .iter()
+            .map(|m| {
+                let p = m.parameters;
+                (
+                    p.visible_region.width,
+                    p.visible_region.height,
+                    p.refresh_rate,
+                )
+            })
+            .collect();
+        let mode = pick_display_mode(&sizes, width, height, refresh_mhz).ok_or(
+            DrawError::Unsupported(super::reason::DrawReason::DisplayModeMissing {
+                width,
+                height,
+                refresh_mhz,
+            }),
+        )?;
+        let planes = self
+            .display_loader
+            .get_physical_device_display_plane_properties(self.pd)
+            .map_err(vk_call(VkOp::DisplayPlaneProperties))?;
+        let mut supported = Vec::with_capacity(planes.len());
+        for index in 0..planes.len() as u32 {
+            let displays = self
+                .display_loader
+                .get_display_plane_supported_displays(self.pd, index)
+                .map_err(vk_call(VkOp::DisplayPlaneSupported))?;
+            supported.push(displays.iter().map(|d| vk::Handle::as_raw(*d)).collect());
+        }
+        let plane = pick_plane(&supported, vk::Handle::as_raw(self.display)).ok_or(
+            DrawError::Unsupported(super::reason::DrawReason::DisplayPlaneMissing),
+        )?;
+        self.display_loader
+            .create_display_plane_surface(
+                &vk::DisplaySurfaceCreateInfoKHR::default()
+                    .display_mode(modes[mode].display_mode)
+                    .plane_index(plane)
+                    .plane_stack_index(planes[plane as usize].current_stack_index)
+                    .transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
+                    .global_alpha(1.0)
+                    .alpha_mode(vk::DisplayPlaneAlphaFlagsKHR::OPAQUE)
+                    .image_extent(vk::Extent2D { width, height }),
+                None,
+            )
+            .map_err(vk_call(VkOp::DisplayCreateSurface))
+    }
+
+    /// `vkReleaseDisplayEXT`: the connector goes back to whoever takes it next.
+    unsafe fn release(self) {
+        let _ = (self.direct_loader.fp().release_display_ext)(self.pd, self.display);
+    }
+}
+
+/// How long a display surface may refuse every acquire with
+/// `ERROR_SURFACE_LOST_KHR` before the refusal is believed.
+#[cfg(all(feature = "host-display", target_os = "linux"))]
+const DISPLAY_LOST_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What an `ERROR_SURFACE_LOST_KHR` from acquiring a display image means.
+#[cfg(all(feature = "host-display", target_os = "linux"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LostAcquire {
+    /// No image was free yet: busy, with the clock of the current run.
+    Busy { since: Instant },
+    /// No acquire has succeeded for [`DISPLAY_LOST_GRACE`]: really lost.
+    Lost,
+}
+
+/// Mesa 25.2.8's `VK_KHR_display` answers an acquire whose finite timeout
+/// expires with no idle image with `ERROR_SURFACE_LOST_KHR`, not `NOT_READY` or
+/// `TIMEOUT`, and the next acquire succeeds (measured with the M3 spike: 0 ns,
+/// 1 ns and 1 ms all do it; only an infinite timeout does not, and this
+/// presenter never blocks under the engine lock). So a refusal is busy while
+/// acquires keep succeeding in between, and a loss once none has for
+/// [`DISPLAY_LOST_GRACE`]. `since` is when the current run of refusals began.
+#[cfg(all(feature = "host-display", target_os = "linux"))]
+fn display_lost_acquire(since: Option<Instant>, now: Instant) -> LostAcquire {
+    let since = since.unwrap_or(now);
+    if now.duration_since(since) >= DISPLAY_LOST_GRACE {
+        LostAcquire::Lost
+    } else {
+        LostAcquire::Busy { since }
+    }
+}
+
+/// The mode of exactly `width`x`height` whose refresh (mHz) is nearest
+/// `refresh_mhz`; `modes` are `(width, height, refresh_mhz)`.
+#[cfg(all(feature = "host-display", target_os = "linux"))]
+fn pick_display_mode(
+    modes: &[(u32, u32, u32)],
+    width: u32,
+    height: u32,
+    refresh_mhz: u32,
+) -> Option<usize> {
+    modes
+        .iter()
+        .enumerate()
+        .filter(|(_, &(w, h, _))| (w, h) == (width, height))
+        .min_by_key(|(_, &(_, _, r))| r.abs_diff(refresh_mhz))
+        .map(|(index, _)| index)
+}
+
+/// The first plane whose supported displays include `display`.
+#[cfg(all(feature = "host-display", target_os = "linux"))]
+fn pick_plane(supported: &[Vec<u64>], display: u64) -> Option<u32> {
+    supported
+        .iter()
+        .position(|displays| displays.contains(&display))
+        .map(|index| index as u32)
 }
 
 /// Everything one in-flight present owns for as long as its blit is running.
@@ -680,8 +1007,7 @@ impl WindowPresenter {
 
     pub(crate) unsafe fn create(
         ctx: &DeviceContext,
-        display: RawDisplayHandle,
-        window: RawWindowHandle,
+        source: SurfaceSource,
         width: u32,
         height: u32,
     ) -> Result<Self, DrawError> {
@@ -690,8 +1016,58 @@ impl WindowPresenter {
                 super::reason::DrawReason::SwapchainUnavailable,
             ));
         }
-        let surface = ash_window::create_surface(&ctx._entry, &ctx.instance, display, window, None)
-            .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowCreateSurface, error)))?;
+        match source {
+            SurfaceSource::Native { display, window } => {
+                let surface =
+                    ash_window::create_surface(&ctx._entry, &ctx.instance, display, window, None)
+                        .map_err(|error| {
+                        DrawError::VkCall(VkCall::new(VkOp::WindowCreateSurface, error))
+                    })?;
+                Self::create_on_surface(ctx, surface, width, height, false)
+            }
+            #[cfg(all(feature = "host-display", target_os = "linux"))]
+            SurfaceSource::Display {
+                drm_fd,
+                connector_id,
+                width: mode_width,
+                height: mode_height,
+                refresh_mhz,
+            } => {
+                let acquired = AcquiredDisplay::acquire(ctx, drm_fd, connector_id)?;
+                let surface = match acquired.plane_surface(mode_width, mode_height, refresh_mhz) {
+                    Ok(surface) => surface,
+                    Err(error) => {
+                        acquired.release();
+                        return Err(error);
+                    }
+                };
+                match Self::create_on_surface(ctx, surface, mode_width, mode_height, true) {
+                    Ok(mut presenter) => {
+                        presenter.display = Some(acquired);
+                        Ok(presenter)
+                    }
+                    Err(error) => {
+                        acquired.release();
+                        Err(error)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Everything after the surface exists: the support check, the command
+    /// pool, the per-present entries and the first swapchain. Destroys the
+    /// surface on any failure. `scanout` is a display plane surface, whose
+    /// swapchain images are also copied out for capture.
+    unsafe fn create_on_surface(
+        ctx: &DeviceContext,
+        surface: vk::SurfaceKHR,
+        width: u32,
+        height: u32,
+        scanout: bool,
+    ) -> Result<Self, DrawError> {
+        #[cfg(not(all(feature = "host-display", target_os = "linux")))]
+        let _ = scanout;
         let surface_loader = ash::khr::surface::Instance::new(&ctx._entry, &ctx.instance);
         let present_capable = surface_loader
             .get_physical_device_surface_support(ctx.pd, ctx.gq, surface)
@@ -819,6 +1195,16 @@ impl WindowPresenter {
             // Attach refused above unless this was true, so the presenter that
             // exists is one whose queue can address its surface.
             present_family_supported: present_capable,
+            #[cfg(all(feature = "host-display", target_os = "linux"))]
+            display: None,
+            #[cfg(all(feature = "host-display", target_os = "linux"))]
+            capture_usage: scanout,
+            #[cfg(all(feature = "host-display", target_os = "linux"))]
+            capture_in_flight: None,
+            #[cfg(all(feature = "host-display", target_os = "linux"))]
+            display_lost_since: None,
+            #[cfg(all(feature = "host-display", target_os = "linux"))]
+            scanout_copy: None,
         };
         // A window created while minimized has no swapchain yet, which is not a
         // failure to attach: `begin_present` retries every frame until the
@@ -985,10 +1371,7 @@ impl WindowPresenter {
         // swapchain.
         let swapchain = self
             .swapchain_loader
-            .create_swapchain(
-                &plan.create_info(self.surface, vk::SwapchainKHR::null()),
-                None,
-            )
+            .create_swapchain(&self.swapchain_create_info(&plan), None)
             .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowCreateSwapchain, error)))?;
         let images = self
             .swapchain_loader
@@ -1104,13 +1487,34 @@ impl WindowPresenter {
         let frame_cmd = self.frames[frame_ix].cmd;
         let frame_image_available = self.frames[frame_ix].image_available;
         let frame_in_flight = self.frames[frame_ix].in_flight;
+        // What a display surface's SURFACE_LOST would mean now (see
+        // `display_lost_acquire`); decided before the call, used only on that arm.
+        #[cfg(all(feature = "host-display", target_os = "linux"))]
+        let display_lost = display_lost_acquire(self.display_lost_since, Instant::now());
         let (image_index, acquire_suboptimal) = match self.swapchain_loader.acquire_next_image(
             self.swapchain,
             0,
             frame_image_available,
             vk::Fence::null(),
         ) {
-            Ok((index, suboptimal)) => (index, suboptimal),
+            Ok((index, suboptimal)) => {
+                #[cfg(all(feature = "host-display", target_os = "linux"))]
+                {
+                    self.display_lost_since = None;
+                }
+                (index, suboptimal)
+            }
+            #[cfg(all(feature = "host-display", target_os = "linux"))]
+            Err(vk::Result::ERROR_SURFACE_LOST_KHR)
+                if self.display.is_some() && matches!(display_lost, LostAcquire::Busy { .. }) =>
+            {
+                if let LostAcquire::Busy { since } = display_lost {
+                    self.display_lost_since = Some(since);
+                }
+                self.cadence_busy_acquire = self.cadence_busy_acquire.saturating_add(1);
+                self.note_cadence(false, false);
+                return Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Busy));
+            }
             Err(vk::Result::NOT_READY) | Err(vk::Result::TIMEOUT) => {
                 self.cadence_busy_acquire = self.cadence_busy_acquire.saturating_add(1);
                 self.note_cadence(false, false);
@@ -1210,6 +1614,10 @@ impl WindowPresenter {
             })
             .or(staged);
 
+        #[cfg(all(feature = "host-display", target_os = "linux"))]
+        self.ensure_scanout_copy(ctx);
+        #[cfg(all(feature = "host-display", target_os = "linux"))]
+        let scanout = self.scanout_copy.as_ref().map(|c| (c.image, c.ready));
         let submit_result = (|| {
             ctx.device
                 .reset_fences(&[frame_in_flight])
@@ -1349,23 +1757,130 @@ impl WindowPresenter {
                     );
                 }
             } else {
-                ctx.device.cmd_clear_color_image(
-                    frame_cmd,
-                    dst,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &vk::ClearColorValue {
-                        float32: SLATE_CLEAR,
-                    },
-                    &[color_range],
-                );
+                // No source. A display keeps what it scans out (`ScanoutCopy`);
+                // a window, and a display with no copy yet, shows slate.
+                #[cfg(all(feature = "host-display", target_os = "linux"))]
+                let kept = match scanout {
+                    Some((copy, true)) => {
+                        // The copy was written by an earlier submission.
+                        ctx.device.cmd_pipeline_barrier(
+                            frame_cmd,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::DependencyFlags::empty(),
+                            &[vk::MemoryBarrier::default()
+                                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)],
+                            &[],
+                            &[],
+                        );
+                        ctx.device.cmd_copy_image(
+                            frame_cmd,
+                            copy,
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                            dst,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            &[full_image_copy(self.extent)],
+                        );
+                        true
+                    }
+                    _ => false,
+                };
+                #[cfg(not(all(feature = "host-display", target_os = "linux")))]
+                let kept = false;
+                if !kept {
+                    ctx.device.cmd_clear_color_image(
+                        frame_cmd,
+                        dst,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &vk::ClearColorValue {
+                            float32: SLATE_CLEAR,
+                        },
+                        &[color_range],
+                    );
+                }
             }
+            // A display copies its finished image into the scanout copy, which
+            // leaves the swapchain image in `TRANSFER_SRC_OPTIMAL` after a read.
+            #[cfg(all(feature = "host-display", target_os = "linux"))]
+            let dst_in_src = match scanout {
+                Some((copy, ready)) => {
+                    image_barrier(
+                        &ctx.device,
+                        frame_cmd,
+                        dst,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::TRANSFER_READ,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                    );
+                    image_barrier(
+                        &ctx.device,
+                        frame_cmd,
+                        copy,
+                        if ready {
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+                        } else {
+                            vk::ImageLayout::UNDEFINED
+                        },
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_READ,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                    );
+                    ctx.device.cmd_copy_image(
+                        frame_cmd,
+                        dst,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        copy,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[full_image_copy(self.extent)],
+                    );
+                    image_barrier(
+                        &ctx.device,
+                        frame_cmd,
+                        copy,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::TRANSFER_READ,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                    );
+                    true
+                }
+                None => false,
+            };
+            // A requested capture copies the finished image out on the way to
+            // present, which leaves it in `TRANSFER_SRC_OPTIMAL` after a read.
+            #[cfg(all(feature = "host-display", target_os = "linux"))]
+            let captured = self
+                .record_capture(ctx, frame_cmd, dst, frame_in_flight, dst_in_src)
+                .is_some()
+                || dst_in_src;
+            #[cfg(not(all(feature = "host-display", target_os = "linux")))]
+            let captured = false;
+            let (last_layout, last_access) = if captured {
+                (
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_READ,
+                )
+            } else {
+                (
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                )
+            };
             image_barrier(
                 &ctx.device,
                 frame_cmd,
                 dst,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                last_layout,
                 vk::ImageLayout::PRESENT_SRC_KHR,
-                vk::AccessFlags::TRANSFER_WRITE,
+                last_access,
                 vk::AccessFlags::empty(),
                 vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::BOTTOM_OF_PIPE,
@@ -1392,7 +1907,21 @@ impl WindowPresenter {
         })();
         // A plain `?` now the failure arm has nothing to undo: it used to have to
         // drop the pins this present had taken before returning.
+        // A capture recorded into a submission that never happened waits on a
+        // fence nothing will signal: give its buffer back now.
+        #[cfg(all(feature = "host-display", target_os = "linux"))]
+        if submit_result.is_err() {
+            if let Some(capture) = self.capture_in_flight.take() {
+                capture.destroy(&ctx.device);
+            }
+        }
         let submission = submit_result?;
+        // Queued: the copy holds this present's image once the queue gets there,
+        // and every later reader is ordered behind it on the same queue.
+        #[cfg(all(feature = "host-display", target_os = "linux"))]
+        if let Some(copy) = self.scanout_copy.as_mut() {
+            copy.ready = true;
+        }
         // Claimed before the latch, so the slot is never observed clear while
         // the latch says an entry is outstanding.
         begin_present_in_flight();
@@ -1771,6 +2300,212 @@ impl WindowPresenter {
         }
     }
 
+    /// A [`ScanoutCopy`] at the swapchain's extent, for a display surface. The
+    /// extent only changes on a swapchain recreation, which idles the queue
+    /// first, so the old copy has no reader left when it is replaced. A copy
+    /// that cannot be made is declined once and the display presents without
+    /// one (slate where there is no source, as a window does).
+    #[cfg(all(feature = "host-display", target_os = "linux"))]
+    unsafe fn ensure_scanout_copy(&mut self, ctx: &DeviceContext) {
+        if !self.capture_usage {
+            return;
+        }
+        let (width, height) = (self.extent.width, self.extent.height);
+        if self
+            .scanout_copy
+            .as_ref()
+            .is_some_and(|c| (c.width, c.height) == (width, height))
+        {
+            return;
+        }
+        if let Some(old) = self.scanout_copy.take() {
+            old.destroy(&ctx.device);
+        }
+        match ScanoutCopy::create(ctx, width, height) {
+            Ok(copy) => self.scanout_copy = Some(copy),
+            Err(decline) => {
+                crate::observe::Emit::decline("host_display_scanout_copy", &decline).fail_once(0)
+            }
+        }
+    }
+
+    /// The plan's create info, plus `TRANSFER_SRC` on a display surface so a
+    /// present can copy the image it scans out.
+    fn swapchain_create_info(
+        &self,
+        plan: &reims_vgpu_vulkan::swapchain::Plan,
+    ) -> vk::SwapchainCreateInfoKHR<'static> {
+        let info = plan.create_info(self.surface, vk::SwapchainKHR::null());
+        #[cfg(all(feature = "host-display", target_os = "linux"))]
+        if self.capture_usage {
+            return info.image_usage(info.image_usage | vk::ImageUsageFlags::TRANSFER_SRC);
+        }
+        info
+    }
+
+    /// Record, into `cmd`, a copy of swapchain image `image` (in
+    /// `TRANSFER_DST_OPTIMAL`, just written) into a new host-readable buffer,
+    /// leaving it in `TRANSFER_SRC_OPTIMAL`. `None` when there is no request,
+    /// the surface cannot be copied from, a copy is already on its way, or the
+    /// buffer could not be made (declined and logged; the present goes on).
+    #[cfg(all(feature = "host-display", target_os = "linux"))]
+    unsafe fn record_capture(
+        &mut self,
+        ctx: &DeviceContext,
+        cmd: vk::CommandBuffer,
+        image: vk::Image,
+        fence: vk::Fence,
+        image_in_src: bool,
+    ) -> Option<()> {
+        if !self.capture_usage || self.capture_in_flight.is_some() {
+            return None;
+        }
+        let path = CAPTURE_REQUEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()?;
+        let (width, height) = (self.extent.width, self.extent.height);
+        let size = u64::from(width) * u64::from(height) * 4;
+        let refuse = |op, error| {
+            let decline = VkCall::new(op, error);
+            crate::observe::Emit::decline("host_display_capture", &decline).fail();
+            None
+        };
+        let buffer = match ctx.device.create_buffer(
+            &vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE),
+            None,
+        ) {
+            Ok(buffer) => buffer,
+            Err(error) => return refuse(VkOp::WindowCreateStagingImage, error),
+        };
+        let req = ctx.device.get_buffer_memory_requirements(buffer);
+        let Some(mem_type) = ctx.memory_type_for(
+            req.memory_type_bits,
+            req.size,
+            crate::backend::vulkan::caps::MemoryClass::Readback,
+        ) else {
+            ctx.device.destroy_buffer(buffer, None);
+            return refuse(
+                VkOp::WindowAllocateStagingMemory,
+                vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+            );
+        };
+        let memory = match ctx.device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(mem_type),
+            None,
+        ) {
+            Ok(memory) => memory,
+            Err(error) => {
+                ctx.device.destroy_buffer(buffer, None);
+                return refuse(VkOp::WindowAllocateStagingMemory, error);
+            }
+        };
+        if let Err(error) = ctx.device.bind_buffer_memory(buffer, memory, 0) {
+            ctx.device.destroy_buffer(buffer, None);
+            ctx.device.free_memory(memory, None);
+            return refuse(VkOp::WindowBindStagingMemory, error);
+        }
+        if !image_in_src {
+            image_barrier(
+                &ctx.device,
+                cmd,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::TRANSFER_READ,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+            );
+        }
+        ctx.device.cmd_copy_image_to_buffer(
+            cmd,
+            image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            buffer,
+            &[vk::BufferImageCopy::default()
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })],
+        );
+        // The copy's writes, made visible to the host once the fence says so.
+        ctx.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &[vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)],
+            &[],
+            &[],
+        );
+        self.capture_in_flight = Some(CaptureInFlight {
+            path,
+            buffer,
+            memory,
+            width,
+            height,
+            fence,
+        });
+        Some(())
+    }
+
+    /// The captured image, once the present that copied it has completed.
+    #[cfg(all(feature = "host-display", target_os = "linux"))]
+    pub(crate) unsafe fn take_capture(&mut self, ctx: &DeviceContext) -> Option<CapturedFrame> {
+        let done = self
+            .capture_in_flight
+            .as_ref()
+            .is_some_and(|c| ctx.device.get_fence_status(c.fence).unwrap_or(false));
+        if !done {
+            return None;
+        }
+        let capture = self.capture_in_flight.take()?;
+        let len = capture.width as usize * capture.height as usize * 4;
+        let frame =
+            match ctx
+                .device
+                .map_memory(capture.memory, 0, len as u64, vk::MemoryMapFlags::empty())
+            {
+                Ok(pointer) => {
+                    // A Readback type may be non-coherent: invalidate before reading.
+                    let _ = ctx.device.invalidate_mapped_memory_ranges(&[
+                        vk::MappedMemoryRange::default()
+                            .memory(capture.memory)
+                            .size(vk::WHOLE_SIZE),
+                    ]);
+                    let bgra = std::slice::from_raw_parts(pointer as *const u8, len).to_vec();
+                    ctx.device.unmap_memory(capture.memory);
+                    Some(CapturedFrame {
+                        path: capture.path.clone(),
+                        width: capture.width,
+                        height: capture.height,
+                        bgra,
+                    })
+                }
+                Err(error) => {
+                    let decline = VkCall::new(VkOp::WindowMapStagingMemory, error);
+                    crate::observe::Emit::decline("host_display_capture", &decline).fail();
+                    None
+                }
+            };
+        capture.destroy(&ctx.device);
+        frame
+    }
+
     pub(crate) unsafe fn destroy(&mut self, ctx: &DeviceContext) {
         if let Err(error) = ctx.queue_wait_idle() {
             let decline = VkCall::new(VkOp::WindowDestroyQueueWaitIdle, error);
@@ -1778,6 +2513,14 @@ impl WindowPresenter {
         }
         if let Some(staging) = self.staging.take() {
             staging.destroy(&ctx.device);
+        }
+        #[cfg(all(feature = "host-display", target_os = "linux"))]
+        if let Some(capture) = self.capture_in_flight.take() {
+            capture.destroy(&ctx.device);
+        }
+        #[cfg(all(feature = "host-display", target_os = "linux"))]
+        if let Some(copy) = self.scanout_copy.take() {
+            copy.destroy(&ctx.device);
         }
         // Drained rather than iterated, so a second `destroy` — `create` calls
         // it on a failed `recreate_swapchain`, and the caller may call it again
@@ -1805,6 +2548,11 @@ impl WindowPresenter {
             self.swapchain = vk::SwapchainKHR::null();
         }
         self.surface_loader.destroy_surface(self.surface, None);
+        // After the surface: the display outlives every object built on it.
+        #[cfg(all(feature = "host-display", target_os = "linux"))]
+        if let Some(display) = self.display.take() {
+            display.release();
+        }
     }
 }
 
@@ -1868,6 +2616,22 @@ fn window_cadence_line(
          present_hz={hz:.1} offered_hz={offered_hz:.1} direct_frac={direct_fraction:.2}",
         busy.total, busy.fence, busy.acquire, busy.no_area
     )
+}
+
+/// One colour image onto another of the same `extent`, whole.
+#[cfg(all(feature = "host-display", target_os = "linux"))]
+fn full_image_copy(extent: vk::Extent2D) -> vk::ImageCopy {
+    let layers = vk::ImageSubresourceLayers::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .layer_count(1);
+    vk::ImageCopy::default()
+        .src_subresource(layers)
+        .dst_subresource(layers)
+        .extent(vk::Extent3D {
+            width: extent.width,
+            height: extent.height,
+            depth: 1,
+        })
 }
 
 #[allow(
@@ -2150,6 +2914,48 @@ mod tests {
         assert!(
             images(2) < PRESENT_IN_FLIGHT,
             "a surface capped at two is the case the depth cannot be served in"
+        );
+    }
+
+    #[cfg(all(feature = "host-display", target_os = "linux"))]
+    #[test]
+    fn display_mode_matches_size_and_nearest_refresh() {
+        let modes = [
+            (1360, 768, 60_000),
+            (1920, 1080, 50_000),
+            (1920, 1080, 60_000),
+        ];
+        assert_eq!(pick_display_mode(&modes, 1920, 1080, 59_940), Some(2));
+        assert_eq!(pick_display_mode(&modes, 1280, 720, 60_000), None);
+    }
+
+    #[cfg(all(feature = "host-display", target_os = "linux"))]
+    #[test]
+    fn display_plane_is_the_first_that_supports_the_display() {
+        let supported = vec![vec![7], vec![9, 11], vec![11]];
+        assert_eq!(pick_plane(&supported, 11), Some(1));
+        assert_eq!(pick_plane(&supported, 5), None);
+    }
+
+    #[cfg(all(feature = "host-display", target_os = "linux"))]
+    #[test]
+    fn display_surface_lost_on_acquire_is_busy_until_it_lasts() {
+        let t0 = Instant::now();
+        let ms = std::time::Duration::from_millis;
+        // First refusal starts the clock and is busy.
+        assert_eq!(
+            display_lost_acquire(None, t0),
+            LostAcquire::Busy { since: t0 }
+        );
+        // Still refusing 1.9 s later: busy, same clock.
+        assert_eq!(
+            display_lost_acquire(Some(t0), t0 + ms(1900)),
+            LostAcquire::Busy { since: t0 }
+        );
+        // No good acquire for 2 s: the surface is really gone.
+        assert_eq!(
+            display_lost_acquire(Some(t0), t0 + ms(2000)),
+            LostAcquire::Lost
         );
     }
 }
