@@ -66,6 +66,12 @@ pub struct Census {
     pub edges_from_unknown_mode: usize,
 }
 
+/// Retired accesses `admit` tolerates before it compacts, once they are also at
+/// least half of what the graph holds. Compaction is linear in the live
+/// accesses, so paying it after this many retirements keeps `admit` amortized
+/// constant instead of linear in the boot's history.
+pub const RETIRED_BEFORE_COMPACT: usize = 1024;
+
 /// The live hazard state.
 ///
 /// Holds only accesses whose transactions have not retired. Retiring is the
@@ -97,6 +103,9 @@ pub struct DependencyGraph {
     /// signature owns.
     scratch: Vec<usize>,
     waits: Vec<IngressOrdinal>,
+    /// Entries `retire` has cleared since the last compaction. The indexes
+    /// still point at them, and `gather` hands every one to `admit`.
+    retired: usize,
 }
 
 impl DependencyGraph {
@@ -114,6 +123,12 @@ impl DependencyGraph {
     #[must_use]
     pub fn live_accesses(&self) -> usize {
         self.entries.iter().filter(|e| e.live).count()
+    }
+
+    /// Accesses held, live or retired: what every `admit` may have to walk.
+    #[must_use]
+    pub fn held_accesses(&self) -> usize {
+        self.entries.len()
     }
 
     /// Admit one transaction's accesses and return the ordinals it must wait
@@ -141,6 +156,13 @@ impl DependencyGraph {
                 .is_none_or(|last| ordinal > last.ordinal),
             "transactions are admitted in ingress order; {ordinal:?} arrived after a later one"
         );
+        // The runtime retires but never compacts, and retired entries stay in
+        // every index `gather` reads. Left alone they grow with the boot's whole
+        // history and so does each admission. Compacting only retired entries
+        // drops no edge anything is still owed.
+        if self.retired >= RETIRED_BEFORE_COMPACT && 2 * self.retired >= self.entries.len() {
+            self.compact();
+        }
         // Taken out so the gathering below can borrow the indexes; put back
         // before returning, so the next admission finds the capacity this one
         // grew. Both are cleared here rather than at the end, because a
@@ -261,7 +283,10 @@ impl DependencyGraph {
     /// that retires early publishes a hazard it still owes.
     pub fn retire(&mut self, ordinal: IngressOrdinal) {
         for &idx in self.by_ordinal.get(&ordinal).into_iter().flatten() {
-            self.entries[idx].live = false;
+            if self.entries[idx].live {
+                self.entries[idx].live = false;
+                self.retired += 1;
+            }
         }
         self.by_ordinal.remove(&ordinal);
     }
@@ -286,6 +311,7 @@ impl DependencyGraph {
             self.insert(e.ordinal, e.intent);
         }
         self.census = saved;
+        self.retired = 0;
     }
 }
 
@@ -857,5 +883,42 @@ mod tests {
         );
         assert!(retirements > 1_000, "transactions retired: {retirements}");
         assert!(compactions > 500, "compactions: {compactions}");
+    }
+
+    /// The runtime retires every transaction and never calls `compact`, so on a
+    /// macOS 26 boot the indexes kept every access ever admitted and each
+    /// `admit` walked them all: window fps fell from 38 to 14 over 15 minutes of
+    /// one boot, with 88 % of the drain thread in `admit` (perf, 25/09). The
+    /// graph must stay bounded by its live accesses on its own.
+    #[test]
+    fn retired_accesses_do_not_pile_up_without_a_compact_call() {
+        let mut g = DependencyGraph::new();
+        let k = AccessKey::Whole(res(1));
+        for n in 1..=20_000 {
+            g.admit(ord(n), &[intent(k, AccessMode::Write)]);
+            g.retire(ord(n));
+        }
+        assert!(
+            g.held_accesses() <= 2 * RETIRED_BEFORE_COMPACT + 1,
+            "held {} accesses for 0 live",
+            g.held_accesses()
+        );
+    }
+
+    #[test]
+    fn self_compaction_keeps_the_edges_live_accesses_are_owed() {
+        let mut g = DependencyGraph::new();
+        let live = AccessKey::Whole(res(7));
+        g.admit(ord(1), &[intent(live, AccessMode::Write)]);
+        let churn = AccessKey::Whole(res(1));
+        for n in 2..=20_000 {
+            g.admit(ord(n), &[intent(churn, AccessMode::Write)]);
+            g.retire(ord(n));
+        }
+        assert_eq!(
+            g.admit(ord(20_001), &[intent(live, AccessMode::Read)]),
+            vec![ord(1)],
+            "the one live writer is still owed its edge"
+        );
     }
 }
