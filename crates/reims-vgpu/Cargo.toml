@@ -50,6 +50,14 @@ host-window = [
     "dep:wayland-protocols",
     "dep:x11-dl",
 ]
+# Direct-to-display presentation (M3): the Vulkan rail presents on a DRM
+# connector through VK_KHR_display, with this process as DRM master. No
+# windowing system. Rides on host-window, whose window link the drain already
+# feeds.
+host-display = ["host-window", "dep:libc"]
+# evdev keyboard and mouse with exclusive grab, feeding the same HostAction
+# queue the window uses.
+host-input = ["host-window", "dep:libc"]
 
 [dependencies]
 once_cell = "1"
@@ -109,6 +117,8 @@ wayland-client = { version = "0.31", optional = true }
 wayland-backend = { version = "0.3", features = ["client_system"], optional = true }
 wayland-protocols = { version = "0.32", features = ["client", "unstable"], optional = true }
 x11-dl = { version = "2.21", optional = true }
+# DRM and evdev ioctls for host-display and host-input.
+libc = { version = "0.2", optional = true }
 
 # Metal encode is macOS-only; `backend-metal` is rejected on any other host.
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -152,3 +162,8 @@ required-features = ["host-window"]
 [[example]]
 name = "window_present_off_thread"
 required-features = ["host-window", "backend-vulkan"]
+
+# M3 D1: take a DRM connector through VK_KHR_display and present colours.
+[[example]]
+name = "kms_spike"
+required-features = ["host-display", "backend-vulkan"]

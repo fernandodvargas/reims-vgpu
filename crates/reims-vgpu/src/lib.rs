@@ -121,6 +121,12 @@ pub mod qemu;
 #[cfg(feature = "host-window")]
 pub mod host_window;
 
+/// Direct-to-display presentation: the Vulkan rail presents on a DRM connector
+/// through `VK_KHR_display`, with this process as DRM master, and no window
+/// system underneath. Linux-only: DRM/KMS is a Linux interface.
+#[cfg(all(feature = "host-display", target_os = "linux"))]
+pub mod host_display;
+
 /// The device registry and the entry surface `qemu::abi` wraps. Private, with
 /// the names that surface reaches re-exported below — the shape
 /// `display_surface` and `window_publish` already use.
