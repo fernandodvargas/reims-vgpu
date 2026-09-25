@@ -7543,3 +7543,45 @@ mod arrivals {
         ));
     }
 }
+
+/// A present that takes tens of milliseconds to seconds (macOS 26, t7-fps-vs-load
+/// of 24/09: op 0x06 at ~316 ms a packet, tranches up to 3 s, guest gpuRestart)
+/// must leave one line naming which phase held it. A fast one leaves nothing.
+#[test]
+fn a_fast_present_leaves_no_phase_line() {
+    let phases = PresentPhases {
+        rescue_us: 20_000,
+        capture_us: 29_000,
+        ..PresentPhases::default()
+    };
+    assert_eq!(present_phase_line(7, &phases), None);
+}
+
+#[test]
+fn a_slow_present_names_every_phase_and_the_total() {
+    let phases = PresentPhases {
+        rescue_us: 1,
+        hold_us: 2,
+        surface_us: 3,
+        witness_us: 4,
+        gate_us: 5,
+        capture_us: 60_000,
+        judge_us: 6,
+        complete_us: 7,
+    };
+    let line = present_phase_line(24, &phases).expect("60 ms is slow");
+    for field in [
+        "present_slow mid=24 ",
+        "total_us=60028 ",
+        "rescue_us=1 ",
+        "hold_us=2 ",
+        "surface_us=3 ",
+        "witness_us=4 ",
+        "gate_us=5 ",
+        "capture_us=60000 ",
+        "judge_us=6 ",
+        "complete_us=7",
+    ] {
+        assert!(line.contains(field), "{field} missing: {line}");
+    }
+}

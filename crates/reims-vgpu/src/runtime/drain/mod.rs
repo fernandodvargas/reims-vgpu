@@ -4670,6 +4670,61 @@ fn log_present_page_identity(state: &DeviceState, mapping: u32, w: u32, h: u32) 
     }
 }
 
+/// Where one present's time went, in µs. On macOS 26 a present held op 0x06 for
+/// ~316 ms a packet and a drain tranche for up to 3 s (t7-fps-vs-load, 24/09),
+/// long enough for the guest's GPU watchdog to restart the device; the drain
+/// census says the time is inside this arm and nothing finer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PresentPhases {
+    /// The rescue drains of the other child FIFOs and of the main FIFO.
+    pub rescue_us: u64,
+    /// The translation-deferred check (a held present returns from here).
+    pub hold_us: u64,
+    /// `ensure_surface_for_present` and the MappingInternal backing resolve.
+    pub surface_us: u64,
+    /// Page identity and the guest-plane witness.
+    pub witness_us: u64,
+    /// The unbacked-present gate.
+    pub gate_us: u64,
+    /// `capture_present_frame`.
+    pub capture_us: u64,
+    /// Pixel stats and the content verdict.
+    pub judge_us: u64,
+    /// Scanout enqueue and the present-complete signal.
+    pub complete_us: u64,
+}
+
+/// A present this long leaves a `present_slow` line. Six frames at 120 Hz: far
+/// above a normal present (well under 1 ms) and far below a watchdog restart.
+const PRESENT_SLOW_US: u64 = 50_000;
+
+/// The line a slow present leaves, or `None` for a fast one. Returned rather
+/// than emitted so the rule is testable without a log sink.
+pub(crate) fn present_phase_line(mapping: u32, p: &PresentPhases) -> Option<String> {
+    let total = p.rescue_us
+        + p.hold_us
+        + p.surface_us
+        + p.witness_us
+        + p.gate_us
+        + p.capture_us
+        + p.judge_us
+        + p.complete_us;
+    (total >= PRESENT_SLOW_US).then(|| {
+        format!(
+            "present_slow mid={mapping} total_us={total} rescue_us={} hold_us={} surface_us={} \
+             witness_us={} gate_us={} capture_us={} judge_us={} complete_us={}",
+            p.rescue_us,
+            p.hold_us,
+            p.surface_us,
+            p.witness_us,
+            p.gate_us,
+            p.capture_us,
+            p.judge_us,
+            p.complete_us
+        )
+    })
+}
+
 /// Present a named mapping to the host console (op8 DisplaySwapMapping, or the
 /// x86 display pipe's op6/op7 transactions).
 fn present_named_mapping<H: HostMemory + HostOps>(
@@ -4681,6 +4736,13 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     if mapping == 0 {
         return ChildPacketDisposition::Complete;
     }
+    let mut phases = PresentPhases::default();
+    let mut clock = std::time::Instant::now();
+    let lap = |clock: &mut std::time::Instant| {
+        let us = clock.elapsed().as_micros() as u64;
+        *clock = std::time::Instant::now();
+        us
+    };
     // Archive apple_pv_gpu_display_swap:
     //   render_wait_surface(s, false, swap->mapping_id);
     //   scanout_present_boundary(...);
@@ -4715,6 +4777,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // Body-layer child work may be doorbell'd from main packets.
         drain_other_child_fifos(state, host, skip);
     }
+    phases.rescue_us = lap(&mut clock);
 
     // Preflight translation keeps an EXEC packet at its channel head. If one
     // is still held after all rescue drains, accepting this display packet
@@ -4735,6 +4798,8 @@ fn present_named_mapping<H: HostMemory + HostOps>(
                 state.present_translation_holds
             ));
         }
+        phases.hold_us = lap(&mut clock);
+        note_present_phases(mapping, &phases);
         return ChildPacketDisposition::Deferred;
     }
     if state.present_translation_hold_mask & current_bit != 0 {
@@ -4745,6 +4810,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         ));
     }
 
+    phases.hold_us = lap(&mut clock);
     state.present.present_mapping = mapping;
     state.present.host_mapping = mapping;
     state.present.valid = true;
@@ -4760,6 +4826,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     if force {
         let _ = crate::runtime::mapper::resolve_mapping_backing(state, host, mapping);
     }
+    phases.surface_us = lap(&mut clock);
     // Paint only from the presented surface's own geom — never the
     // previous console size fallback (that freezes mode switches).
     // Re-read gen after wait_surface (writebacks may have landed).
@@ -4778,6 +4845,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // Independent of everything below: the guest's own copy of the plane
         // this present names, sampled where the desktop background belongs.
         crate::runtime::scanout::note_present_field_witness(state, &*host, mapping, w, h);
+        phases.witness_us = lap(&mut clock);
         // Every present takes one route: capture the surface the transaction
         // named. A ClearOnly present — one whose named mid's most recent write
         // was a `display_clear`/CLEAR Store rather than a draw — used to take a
@@ -4856,7 +4924,9 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // rotation step behind the one the guest asked for — residue when a
         // window closed in between, a stale region when one moved, thrash as
         // the choice oscillates.
+        phases.gate_us = lap(&mut clock);
         let encoded = crate::runtime::scanout::capture_present_frame(state, mapping, w, h, gen);
+        phases.capture_us = lap(&mut clock);
         if !encoded {
             // Retry encode at first host paint. Do **not** clear
             // frame_valid: PGDisplay keeps the prior presentFrame
@@ -4925,6 +4995,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // not.
         // One line per accepted present, verbose-only. `present_enqueue` carried
         // the same fields through the always-on sink alongside it.
+        phases.judge_us = lap(&mut clock);
         crate::observe::line(format!(
             "present paint mid={mapping} {w}x{h} gen={gen} encoded={} retain={} unpainted={}",
             encoded as u8,
@@ -4953,7 +5024,16 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     // +0x188 retain (also when geometry held the paint): display
     // shared-page present bit + conditional display IRQ.
     signal_display_present_complete(state, host);
+    phases.complete_us = lap(&mut clock);
+    note_present_phases(mapping, &phases);
     ChildPacketDisposition::Complete
+}
+
+/// Emit the `present_slow` line when a present was slow.
+fn note_present_phases(mapping: u32, phases: &PresentPhases) {
+    if let Some(line) = present_phase_line(mapping, phases) {
+        crate::observe::off(line);
+    }
 }
 
 /// The six lifecycle commands that share [`apply_map_family`]'s body.
